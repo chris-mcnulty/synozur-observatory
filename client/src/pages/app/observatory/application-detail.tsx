@@ -15,8 +15,9 @@ import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useUser } from "@/lib/userContext";
 import { useLocation } from "wouter";
+import { Switch } from "@/components/ui/switch";
 import { ArrowLeft, Plus, Loader2, Trash2, GitBranch, ShieldCheck, AlertTriangle, Pencil } from "lucide-react";
-import { VersionStatusBadge, AssessmentStatusBadge, SeverityBadge, FindingStatusBadge, VERSION_STATUSES, ASSESSMENT_TYPES, labelFor } from "./shared";
+import { VersionStatusBadge, AssessmentStatusBadge, SeverityBadge, FindingStatusBadge, VERSION_STATUSES, ASSESSMENT_TYPES, DATA_CLASSIFICATIONS, labelFor } from "./shared";
 import { formatDate } from "@/lib/utils";
 
 interface Detail {
@@ -47,6 +48,54 @@ export default function ObservatoryApplicationDetail() {
   const canWrite = ["Analyst", "Domain Admin", "Global Admin"].includes(user?.role ?? "");
 
   const { data: app, isLoading } = useQuery<Detail>({ queryKey: [`/api/observatory/applications/${id}`] });
+
+  const [editDialogOpen, setEditDialogOpen] = useState(false);
+  const [editForm, setEditForm] = useState({
+    name: "", productFamily: "", description: "", businessOwner: "",
+    technicalOwner: "", hostingPlatform: "", authMethod: "",
+    dataClassification: "internal", aiEnabled: false,
+    certificationTarget: "", appUrl: "", repoUrl: "",
+  });
+
+  const openEdit = () => {
+    setEditForm({
+      name: app.name,
+      productFamily: app.productFamily ?? "",
+      description: app.description ?? "",
+      businessOwner: app.businessOwner ?? "",
+      technicalOwner: app.technicalOwner ?? "",
+      hostingPlatform: app.hostingPlatform ?? "",
+      authMethod: app.authMethod ?? "",
+      dataClassification: (app as any).dataClassification ?? "internal",
+      aiEnabled: app.aiEnabled,
+      certificationTarget: app.certificationTarget ?? "",
+      appUrl: app.appUrl ?? "",
+      repoUrl: app.repoUrl ?? "",
+    });
+    setEditDialogOpen(true);
+  };
+
+  const updateApp = useMutation({
+    mutationFn: async () =>
+      (await apiRequest("PATCH", `/api/observatory/applications/${id}`, {
+        ...editForm,
+        productFamily: editForm.productFamily || null,
+        description: editForm.description || null,
+        businessOwner: editForm.businessOwner || null,
+        technicalOwner: editForm.technicalOwner || null,
+        hostingPlatform: editForm.hostingPlatform || null,
+        authMethod: editForm.authMethod || null,
+        certificationTarget: editForm.certificationTarget || null,
+        appUrl: editForm.appUrl || null,
+        repoUrl: editForm.repoUrl || null,
+      })).json(),
+    onSuccess: () => {
+      invalidate();
+      setEditDialogOpen(false);
+      toast({ title: "Application updated" });
+    },
+    onError: (err: Error) => toast({ title: "Save failed", description: err.message, variant: "destructive" }),
+  });
 
   const [versionDialogOpen, setVersionDialogOpen] = useState(false);
   const [versionForm, setVersionForm] = useState({ versionNumber: "", environment: "production", assessmentStatus: "Draft", branch: "", notes: "", releaseDate: "" });
@@ -125,6 +174,10 @@ export default function ObservatoryApplicationDetail() {
             {app.description && <p className="text-muted-foreground text-sm mt-1 max-w-2xl">{app.description}</p>}
           </div>
           {canWrite && (
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={openEdit} data-testid="button-edit-application">
+                <Pencil className="h-4 w-4 mr-2" /> Edit
+              </Button>
             <AlertDialog>
               <AlertDialogTrigger asChild>
                 <Button variant="outline" size="sm" data-testid="button-delete-application">
@@ -144,6 +197,7 @@ export default function ObservatoryApplicationDetail() {
                 </AlertDialogFooter>
               </AlertDialogContent>
             </AlertDialog>
+            </div>
           )}
         </div>
 
@@ -298,6 +352,82 @@ export default function ObservatoryApplicationDetail() {
             <Button variant="outline" onClick={() => setVersionDialogOpen(false)} data-testid="button-cancel-version">Cancel</Button>
             <Button onClick={() => createVersion.mutate()} disabled={!versionForm.versionNumber.trim() || createVersion.isPending} data-testid="button-save-version">
               {createVersion.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />} Create version
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit application dialog */}
+      <Dialog open={editDialogOpen} onOpenChange={setEditDialogOpen}>
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Edit Application</DialogTitle>
+            <DialogDescription>Update the application details and scan URL.</DialogDescription>
+          </DialogHeader>
+          <div className="grid grid-cols-2 gap-4 py-2">
+            <div className="space-y-2 col-span-2">
+              <Label htmlFor="edit-app-name">Name *</Label>
+              <Input id="edit-app-name" value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} data-testid="input-edit-app-name" />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-app-family">Product family</Label>
+              <Input id="edit-app-family" value={editForm.productFamily} onChange={(e) => setEditForm({ ...editForm, productFamily: e.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <Label>Data classification</Label>
+              <Select value={editForm.dataClassification} onValueChange={(v) => setEditForm({ ...editForm, dataClassification: v })}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {DATA_CLASSIFICATIONS.map((c) => (
+                    <SelectItem key={c} value={c}>{c.charAt(0).toUpperCase() + c.slice(1)}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2 col-span-2">
+              <Label htmlFor="edit-app-desc">Description</Label>
+              <Textarea id="edit-app-desc" rows={2} value={editForm.description} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-app-bowner">Business owner</Label>
+              <Input id="edit-app-bowner" value={editForm.businessOwner} onChange={(e) => setEditForm({ ...editForm, businessOwner: e.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-app-towner">Technical owner</Label>
+              <Input id="edit-app-towner" value={editForm.technicalOwner} onChange={(e) => setEditForm({ ...editForm, technicalOwner: e.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-app-hosting">Hosting platform</Label>
+              <Input id="edit-app-hosting" placeholder="e.g. Azure App Service" value={editForm.hostingPlatform} onChange={(e) => setEditForm({ ...editForm, hostingPlatform: e.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-app-auth">Authentication method</Label>
+              <Input id="edit-app-auth" placeholder="e.g. Microsoft Entra ID" value={editForm.authMethod} onChange={(e) => setEditForm({ ...editForm, authMethod: e.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-app-cert">Certification target</Label>
+              <Input id="edit-app-cert" placeholder="e.g. WCAG 2.1 AA" value={editForm.certificationTarget} onChange={(e) => setEditForm({ ...editForm, certificationTarget: e.target.value })} />
+            </div>
+            <div className="space-y-2 flex items-end">
+              <div className="flex items-center gap-2 pb-1">
+                <Switch checked={editForm.aiEnabled} onCheckedChange={(v) => setEditForm({ ...editForm, aiEnabled: v })} />
+                <Label>AI-enabled application</Label>
+              </div>
+            </div>
+            <div className="space-y-2 col-span-2">
+              <Label htmlFor="edit-app-url">Application URL</Label>
+              <Input id="edit-app-url" placeholder="https://app.example.com" value={editForm.appUrl} onChange={(e) => setEditForm({ ...editForm, appUrl: e.target.value })} data-testid="input-edit-app-url" />
+              <p className="text-xs text-muted-foreground">Used as the target for automated accessibility, security, and performance scans.</p>
+            </div>
+            <div className="space-y-2 col-span-2">
+              <Label htmlFor="edit-app-repo">Repository URL</Label>
+              <Input id="edit-app-repo" value={editForm.repoUrl} onChange={(e) => setEditForm({ ...editForm, repoUrl: e.target.value })} />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditDialogOpen(false)}>Cancel</Button>
+            <Button onClick={() => updateApp.mutate()} disabled={!editForm.name.trim() || updateApp.isPending} data-testid="button-save-edit-application">
+              {updateApp.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />} Save changes
             </Button>
           </DialogFooter>
         </DialogContent>

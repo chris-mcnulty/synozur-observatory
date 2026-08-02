@@ -1,6 +1,6 @@
 import React from "react";
 import { Link, useLocation } from "wouter";
-import { Home, Telescope, Megaphone, Search, Menu } from "lucide-react";
+import { Home, Radar, ShieldCheck, Search, Menu } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getActiveAreaId } from "@/lib/areaNavigation";
 
@@ -32,19 +32,19 @@ export default function MobileBottomNav({ onOpenMenu, onOpenCommandPalette }: Mo
     },
     {
       kind: "link",
-      label: "Research",
-      href: "/app/dashboard",
-      icon: Telescope,
-      match: (p) => getActiveAreaId(p) === "research",
-      testId: "mobile-nav-insights",
+      label: "Observatory",
+      href: "/app/observatory",
+      icon: Radar,
+      match: (p) => getActiveAreaId(p) === "observatory",
+      testId: "mobile-nav-observatory",
     },
     {
       kind: "link",
-      label: "Marketing",
-      href: "/app/marketing",
-      icon: Megaphone,
-      match: (p) => getActiveAreaId(p) === "marketing",
-      testId: "mobile-nav-marketing",
+      label: "Assessments",
+      href: "/app/observatory/assessments",
+      icon: ShieldCheck,
+      match: (p) => p.startsWith("/app/observatory/assessments"),
+      testId: "mobile-nav-assessments",
     },
     {
       kind: "action",

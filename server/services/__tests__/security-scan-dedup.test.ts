@@ -91,7 +91,7 @@ vi.mock("../../context", () => ({
 
 // Capture the async job fn so tests can run it explicitly and verify DB effects.
 vi.mock("../../services/job-queue", () => ({
-  enqueue: vi.fn((_type: any, _label: any, fn: any) => {
+  enqueueScan: vi.fn((_label: any, fn: any) => {
     capturedJob.fn = fn;
   }),
   getJobStatusByLabel: vi.fn(() => ({ status: "not_found" })),
