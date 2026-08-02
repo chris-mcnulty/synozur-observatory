@@ -15,7 +15,7 @@ import { tickMarketingPublishWorker, sweepMissedPosts } from "./marketing-publis
 import { tickEmailSendWorker } from "./email-campaign-sender";
 import { tickHubspotEmailSyncBackfill } from "./hubspot-email-backfill";
 import { refreshSeoForContext } from "../routes/seo";
-import { db, crawlDb } from "../db";
+import { db } from "../db";
 import { marketingPlans, seoMetrics, trackedKeywords, collaborationComments, collaborationThreads, annotations, generatedPosts, scheduledJobRuns, type SeoMetric } from "@shared/schema";
 import { eq, and, desc, isNull, lt, sql, inArray } from "drizzle-orm";
 import type { SeoMover } from "./webhook-formatters";
@@ -71,7 +71,7 @@ async function trackJobStart(
     // Job-lifecycle telemetry goes through the dedicated crawl pool, never the
     // primary pool — these writes fire on every scheduled crawl/monitor job and
     // must not compete with time-sensitive workers (publish/email).
-    const [jobRun] = await crawlDb
+    const [jobRun] = await db
       .insert(scheduledJobRuns)
       .values({
         jobType,
@@ -97,7 +97,7 @@ async function trackJobComplete(
 ): Promise<void> {
   if (!jobRunId) return;
   try {
-    const [updated] = await crawlDb
+    const [updated] = await db
       .update(scheduledJobRuns)
       .set({
         status,
@@ -126,7 +126,7 @@ async function cleanupStuckJobs(): Promise<void> {
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
   // Read/write stuck-job telemetry through the crawl pool (keeps the primary
   // pool free for time-sensitive work).
-  const stuckJobs = await crawlDb
+  const stuckJobs = await db
     .select()
     .from(scheduledJobRuns)
     .where(eq(scheduledJobRuns.status, "running"));
@@ -140,7 +140,7 @@ async function cleanupStuckJobs(): Promise<void> {
     console.log(`[Scheduled Jobs] Cleaning up ${jobsToFail.length} stuck job(s)...`);
     for (const job of jobsToFail) {
       try {
-        await crawlDb
+        await db
           .update(scheduledJobRuns)
           .set({
             status: "failed",

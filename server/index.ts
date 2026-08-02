@@ -12,7 +12,7 @@ import { startScheduledJobs } from "./services/scheduled-jobs";
 import { storage } from "./storage";
 import { setPersistenceHooks } from "./services/job-queue";
 import { runMigrations } from "./db-migrate";
-import { crawlDb } from "./db";
+import { db } from "./db";
 import { scheduledJobRuns } from "@shared/schema";
 import { eq } from "drizzle-orm";
 import pg from "pg";
@@ -259,14 +259,14 @@ app.use((req, res, next) => {
 
   // Wire job-queue persistence so all queued jobs write lifecycle events to
   // scheduled_job_runs. These writes go through the dedicated crawl pool
-  // (crawlDb), NOT the primary pool. Job-lifecycle telemetry is non-urgent and
+  // (db), NOT the primary pool. Job-lifecycle telemetry is non-urgent and
   // high-volume (every crawl/monitor job start + finish), so isolating it from
   // the primary pool keeps connections free for time-sensitive workers like the
   // marketing publish worker.
   setPersistenceHooks({
     async onCreate(job) {
       try {
-        const [run] = await crawlDb
+        const [run] = await db
           .insert(scheduledJobRuns)
           .values({
             jobType: job.type,
@@ -286,7 +286,7 @@ app.use((req, res, next) => {
     async onComplete(dbRowId, status, errorMessage) {
       if (!dbRowId) return;
       try {
-        const [updated] = await crawlDb
+        const [updated] = await db
           .update(scheduledJobRuns)
           .set({
             status,

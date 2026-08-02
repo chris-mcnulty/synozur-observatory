@@ -2217,103 +2217,6 @@ export function registerAdminRoutes(app: Express) {
       }
 
       return res.status(503).json({ error: "Website crawl analysis is no longer available in Observatory." });
-      /* eslint-disable-next-line no-unreachable */
-      const crawlResult = { pages: [], totalWordCount: 0 } as any;
-      
-      // Check if crawl was successful (has at least one page with content)
-      if (!crawlResult.pages || crawlResult.pages.length === 0 || crawlResult.totalWordCount === 0) {
-        // Probe to distinguish "blocked" from "not found / network error"
-        let probedStatus: number | null = null;
-        try {
-          const probe = await fetch(url, {
-            method: "GET",
-            redirect: "follow",
-            headers: {
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-              "Accept-Language": "en-US,en;q=0.9",
-            },
-            signal: AbortSignal.timeout(8000),
-          });
-          probedStatus = probe.status;
-        } catch {
-          // network error / DNS / timeout — leave probedStatus null
-        }
-        if (probedStatus === 403 || probedStatus === 429 || probedStatus === 503 || probedStatus === 401) {
-          return res.status(400).json({
-            error: "This website blocks automated visits, so we can't crawl it for analysis. As a workaround, you can create the entry manually and upload a PDF or paste content as a grounding document.",
-            blocked: true,
-            probedStatus,
-          });
-        }
-        if (probedStatus && probedStatus >= 400) {
-          return res.status(400).json({
-            error: `The website returned HTTP ${probedStatus}. Please verify the URL is correct and publicly accessible.`,
-            probedStatus,
-          });
-        }
-        return res.status(400).json({ error: "Could not analyze website. The site may be blocking automated requests, offline, or returning empty content. You can create the entry manually and upload a grounding document instead." });
-      }
-
-      // Combine page content for AI analysis
-      const combinedContent = crawlResult.pages.map(p => `${p.title}\n${p.content}`).join("\n\n");
-
-      // Extract company name from URL or analysis
-      let companyName = parsedUrl.hostname.replace(/^www\./, "").split(".")[0];
-      companyName = companyName.charAt(0).toUpperCase() + companyName.slice(1);
-
-      // Check if AI is configured
-      if (!process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY) {
-        // Return basic info without AI analysis
-        return res.json({ 
-          companyName, 
-          description: `Market context for ${companyName}`
-        });
-      }
-
-      // Use AI to get a better company name and description
-      const anthropic = new Anthropic({
-        apiKey: process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY,
-        baseURL: process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL,
-      });
-
-      const analysisPrompt = `Analyze this website content and provide:
-1. The company/organization name
-2. A brief 1-2 sentence description of what they do
-3. Whether this is a B2B (business-to-business) or B2C (business-to-consumer) company. B2C companies sell directly to individual consumers — examples include wineries, restaurants, hotels, retail stores, consumer brands. B2B companies sell to other businesses — examples include SaaS, consulting firms, enterprise software, professional services.
-
-Website URL: ${url}
-Website Content:
-${combinedContent.substring(0, 4000)}
-
-Respond in JSON format:
-{
-  "companyName": "Company Name",
-  "description": "Brief description of what the company does",
-  "businessType": "b2b or b2c"
-}`;
-
-      const message = await anthropic.messages.create({
-        model: "claude-sonnet-4-5",
-        max_tokens: 500,
-        messages: [{ role: "user", content: analysisPrompt }],
-      });
-
-      let result = { companyName, description: "", businessType: "b2b" };
-      try {
-        const responseText = message.content[0].type === "text" ? message.content[0].text : "";
-        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          result.companyName = parsed.companyName || companyName;
-          result.description = parsed.description || "";
-          result.businessType = parsed.businessType === "b2c" ? "b2c" : "b2b";
-        }
-      } catch (e) {
-        console.error("Failed to parse AI response for market URL analysis:", e);
-      }
-
-      res.json(result);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -2998,7 +2901,7 @@ Respond in JSON format:
           const typeIcon = item.type === "website_update" ? "🌐" : 
                           item.type === "blog_update" ? "📝" : 
                           item.type === "social_update" ? "📱" : 
-                          item.type === "crawl" ? "🔍" : "📋";
+                          "📋";
           md += `- ${typeIcon} **${item.competitorName || "Unknown"}** - ${item.type} (${date})\n`;
           if (item.summary) md += `  ${item.summary}\n`;
           else if (item.description) md += `  ${item.description}\n`;

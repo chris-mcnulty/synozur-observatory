@@ -48,7 +48,7 @@ import {
 import { z } from "zod";
 import { completeForFeature } from "../services/ai-provider";
 import { securityScanner } from "../services/security-scanner";
-import { enqueue, getJobStatusByLabel } from "../services/job-queue";
+import { enqueueScan, getJobStatusByLabel } from "../services/job-queue";
 
 // ── helpers (mirror server/routes/observatory.ts) ───────────────────────────
 
@@ -858,9 +858,8 @@ export function registerObservatoryModuleRoutes(app: Express) {
         return res.status(202).json({ status: existing.status, message: "Scan already in progress" });
       }
 
-      // Enqueue the scan as a crawl job
-      enqueue(
-        "crawl",
+      // Enqueue the scan through the Observatory scan queue
+      enqueueScan(
         jobLabel,
         async () => {
           const scanResult = await securityScanner.runScan({

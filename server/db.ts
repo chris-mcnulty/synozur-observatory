@@ -25,20 +25,3 @@ pool.on("error", (err) => {
 
 export const db = drizzle(pool, { schema });
 
-// Separate pool for background web-crawl jobs so they cannot exhaust the
-// primary pool and starve API handlers or critical workers like the publish
-// worker.
-export const crawlPool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 3,
-  idleTimeoutMillis: 5000,
-  connectionTimeoutMillis: 10000,
-  keepAlive: true,
-  keepAliveInitialDelayMillis: 10000,
-});
-
-crawlPool.on("error", (err) => {
-  console.error("[Crawl Pool] Idle client error:", err.message);
-});
-
-export const crawlDb = drizzle(crawlPool, { schema });

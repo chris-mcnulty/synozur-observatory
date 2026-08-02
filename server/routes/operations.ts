@@ -28,26 +28,6 @@ export function registerOperationsRoutes(app: Express) {
       
       // Add schedule information with job intervals
       const scheduleInfo = {
-        websiteCrawl: {
-          ...status.websiteCrawl,
-          description: "Crawls competitor websites for content changes",
-          interval: "Every 6 hours",
-        },
-        socialMonitor: {
-          ...status.socialMonitor,
-          description: "Monitors social media profiles for updates",
-          interval: "Every 4 hours",
-        },
-        websiteMonitor: {
-          ...status.websiteMonitor,
-          description: "Detects website changes and generates AI summaries",
-          interval: "Every 6 hours",
-        },
-        productMonitor: {
-          ...status.productMonitor,
-          description: "Monitors standalone product URLs for changes",
-          interval: "Every hour",
-        },
         trialReminder: {
           ...status.trialReminder,
           description: "Sends trial expiration reminder emails",
