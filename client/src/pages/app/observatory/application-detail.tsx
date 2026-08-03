@@ -16,7 +16,7 @@ import { useToast } from "@/hooks/use-toast";
 import { useUser } from "@/lib/userContext";
 import { useLocation } from "wouter";
 import { Switch } from "@/components/ui/switch";
-import { ArrowLeft, Plus, Loader2, Trash2, GitBranch, ShieldCheck, AlertTriangle, Pencil } from "lucide-react";
+import { ArrowLeft, Plus, Loader2, Trash2, GitBranch, ShieldCheck, AlertTriangle, Pencil, ScanLine } from "lucide-react";
 import { VersionStatusBadge, AssessmentStatusBadge, SeverityBadge, FindingStatusBadge, VERSION_STATUSES, ASSESSMENT_TYPES, DATA_CLASSIFICATIONS, labelFor } from "./shared";
 import { formatDate } from "@/lib/utils";
 
@@ -48,6 +48,23 @@ export default function ObservatoryApplicationDetail() {
   const canWrite = ["Analyst", "Domain Admin", "Global Admin"].includes(user?.role ?? "");
 
   const { data: app, isLoading } = useQuery<Detail>({ queryKey: [`/api/observatory/applications/${id}`] });
+
+  const SCANNABLE_TYPES = new Set(["accessibility", "penetration_test", "performance"]);
+  const [scanningId, setScanningId] = useState<string | null>(null);
+
+  const triggerScanMutation = useMutation({
+    mutationFn: async (assessmentId: string) => {
+      const aType = app?.assessments.find((a) => a.id === assessmentId)?.type;
+      const url = aType === "performance"
+        ? `/api/observatory/assessments/${assessmentId}/performance-scan`
+        : `/api/observatory/assessments/${assessmentId}/scan`;
+      return (await apiRequest("POST", url, {})).json();
+    },
+    onMutate: (id) => setScanningId(id),
+    onSettled: () => setScanningId(null),
+    onSuccess: () => toast({ title: "Scan queued", description: "Findings will appear on the assessment page when complete." }),
+    onError: (err: Error) => toast({ title: "Could not start scan", description: err.message, variant: "destructive" }),
+  });
 
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [editForm, setEditForm] = useState({
@@ -258,15 +275,30 @@ export default function ObservatoryApplicationDetail() {
             ) : (
               <div className="space-y-2">
                 {app.assessments.map((a) => (
-                  <Link key={a.id} href={`/app/observatory/assessments/${a.id}`}>
-                    <div className="flex items-center justify-between gap-3 border border-border rounded-md px-3 py-2 cursor-pointer hover:border-primary/50" data-testid={`row-assessment-${a.id}`}>
+                  <div key={a.id} className="flex items-center gap-2 border border-border rounded-md px-3 py-2 hover:border-primary/50 transition-colors" data-testid={`row-assessment-${a.id}`}>
+                    <Link href={`/app/observatory/assessments/${a.id}`} className="flex items-center justify-between gap-3 flex-1 min-w-0 cursor-pointer">
                       <div className="min-w-0">
                         <p className="font-medium text-sm truncate">{a.title}</p>
                         <p className="text-xs text-muted-foreground">{labelFor(ASSESSMENT_TYPES as any, a.type)}</p>
                       </div>
                       <AssessmentStatusBadge status={a.status} />
-                    </div>
-                  </Link>
+                    </Link>
+                    {canWrite && SCANNABLE_TYPES.has(a.type) && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 shrink-0 text-muted-foreground hover:text-primary"
+                        onClick={() => triggerScanMutation.mutate(a.id)}
+                        disabled={scanningId === a.id || triggerScanMutation.isPending}
+                        title="Run automated scan"
+                        data-testid={`button-scan-assessment-${a.id}`}
+                      >
+                        {scanningId === a.id
+                          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          : <ScanLine className="h-3.5 w-3.5" />}
+                      </Button>
+                    )}
+                  </div>
                 ))}
               </div>
             )}
