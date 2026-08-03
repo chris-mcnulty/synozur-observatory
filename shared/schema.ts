@@ -5529,6 +5529,11 @@ export const obsPenTestFindings = pgTable("obs_pen_test_findings", {
   validationStatus: text("validation_status").notNull().default("Not Started"), // OBS_VALIDATION_STATUSES
   validatedBy: text("validated_by"),
   validatedAt: timestamp("validated_at"),
+  // True only for rows created by the backfill endpoint (POST .../relink-findings).
+  // The pen-test deletion route skips explicitly deleting obs_findings rows for
+  // backlinked findings — those belong to the assessment, not exclusively to the
+  // pen test, so they should survive a pen test deletion.
+  backlinkFinding: boolean("backlink_finding").notNull().default(false),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 }, (t) => ({

@@ -147,6 +147,10 @@ const SCAN_FINDING_2 = {
   severity: "Medium",
 };
 
+// Junction rows as the DB would return them: pen-test-owned vs backlinked
+const JUNCTION_OWNED    = { findingId: "find-scan-1", backlinkFinding: false };
+const JUNCTION_BACKLINK = { findingId: "find-scan-2", backlinkFinding: true  };
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function buildApp() {
@@ -170,6 +174,94 @@ describe("observatory module routes — pen test delete", () => {
     dbQ.length = 0;
     vi.mocked(getRequestContext).mockResolvedValue(WRITER_CTX as any);
     app = buildApp();
+  });
+
+  // ── POST /api/observatory/pen-tests/:id/relink-findings ──────────────────
+
+  describe("POST /api/observatory/pen-tests/:id/relink-findings", () => {
+    it("returns 404 when the pen test does not exist for this tenant", async () => {
+      pushDb();  // select(obsPenTests).where() → [] (not found)
+
+      const res = await request(app).post("/api/observatory/pen-tests/nonexistent/relink-findings");
+
+      expect(res.status).toBe(404);
+      expect(res.body.message).toMatch(/not found/i);
+    });
+
+    it("returns 403 when the caller lacks write permission", async () => {
+      vi.mocked(getRequestContext).mockResolvedValue(READONLY_CTX as any);
+
+      const res = await request(app).post("/api/observatory/pen-tests/pt-1/relink-findings");
+
+      expect(res.status).toBe(403);
+    });
+
+    it("returns { relinked: 0 } when the provenance query finds no orphaned scan findings", async () => {
+      // The DB query filters by: assessmentId + scan_report evidence link + no existing
+      // junction row. When all findings either have junction rows already or lack the
+      // scan_report evidence link (manually created), the query returns [].
+      pushDb(PEN_TEST);  // pen test lookup
+      pushDb();          // orphaned findings query → [] (provenance filter excluded all)
+      // No insert or audit calls since we return early.
+
+      const res = await request(app).post("/api/observatory/pen-tests/pt-1/relink-findings");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ relinked: 0 });
+      expect(dbQ).toHaveLength(0);  // exactly 2 queue entries consumed
+    });
+
+    it("relinks orphaned scan-runner findings (with scan_report evidence) and returns the count", async () => {
+      // The SQL WHERE clause restricts to findings with a scan_report evidence link
+      // shared with the assessment (obs_finding_evidence JOIN obs_assessment_evidence
+      // JOIN obs_evidence WHERE evidence_type = 'scan_report'). The mock simulates
+      // the DB returning only those correctly filtered findings.
+      // Each new junction row has backlinkFinding = true so the pen test deletion
+      // route does NOT explicitly delete the underlying obs_findings rows.
+      pushDb(PEN_TEST);                               // pen test lookup
+      pushDb(SCAN_FINDING, SCAN_FINDING_2);           // 2 orphaned scan findings returned
+      pushDb();                                       // insert(obsPenTestFindings).onConflictDoNothing
+      pushDb();                                       // audit insert
+
+      const res = await request(app).post("/api/observatory/pen-tests/pt-1/relink-findings");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ relinked: 2 });
+      expect(dbQ).toHaveLength(0);  // all 4 queue entries consumed
+    });
+
+    it("is idempotent — re-running after findings are already linked returns 0", async () => {
+      // On a second run the NOT EXISTS predicate filters out all previously linked
+      // findings, so the query returns [] and no insert/audit is issued.
+      pushDb(PEN_TEST);  // pen test lookup
+      pushDb();          // orphaned findings query → [] (already linked)
+
+      const res = await request(app).post("/api/observatory/pen-tests/pt-1/relink-findings");
+
+      expect(res.status).toBe(200);
+      expect(res.body.relinked).toBe(0);
+      expect(dbQ).toHaveLength(0);
+    });
+
+    it("skips insert and audit when provenance filter excludes all candidates", async () => {
+      // Regression guard: when the DB returns [] (because the scan_report evidence
+      // predicate filtered out manually created findings), the early-return path must
+      // skip the insert + audit so no spurious DB writes happen.
+      //
+      // This also covers the case where an analyst manually created a security
+      // finding (POST /api/observatory/findings) for this pen test's assessment —
+      // that finding lacks the scan_report evidence link and is correctly excluded
+      // by the DB query, so it never appears on the pen test page.
+      pushDb(PEN_TEST);  // pen test lookup
+      pushDb();          // orphaned query → [] (provenance filter excluded manual finding)
+      // Any extra queue consume here would mean insert or audit was incorrectly issued.
+
+      const res = await request(app).post("/api/observatory/pen-tests/pt-1/relink-findings");
+
+      expect(res.status).toBe(200);
+      expect(res.body.relinked).toBe(0);
+      expect(dbQ).toHaveLength(0);  // exactly 2 entries consumed
+    });
   });
 
   // ── DELETE /api/observatory/pen-tests/:id ─────────────────────────────────
@@ -208,26 +300,19 @@ describe("observatory module routes — pen test delete", () => {
       expect(dbQ).toHaveLength(0);
     });
 
-    it("deletes a pen test with scan findings and removes all underlying obs_findings rows", async () => {
-      // This is the primary cascade regression guard.
-      //
-      // When a pen test is deleted:
-      //   obs_pen_test_findings rows are removed by the penTestId FK cascade ✓
-      //   obs_findings rows are NOT removed by that cascade — they must be
-      //   explicitly deleted. Without this the underlying finding rows accumulate
-      //   as orphans. This test verifies the route does the explicit delete.
+    it("deletes a pen test with pen-test-owned findings and removes the underlying obs_findings rows", async () => {
+      // Primary cascade regression guard: pen-test-owned findings (backlinkFinding=false)
+      // must be explicitly deleted because the penTestId FK cascade only removes the
+      // junction rows, not the underlying obs_findings rows.
       //
       // DB call order inside the transaction:
-      //   1. SELECT finding IDs from obs_pen_test_findings
+      //   1. SELECT { findingId, backlinkFinding } from obs_pen_test_findings
       //   2. DELETE obs_pen_tests (cascades junction rows)
-      //   3. DELETE obs_findings for the collected IDs
-      //
-      // A queue underrun on step 3 means the findings delete was removed — the
-      // regression is caught immediately.
+      //   3. DELETE obs_findings for the collected non-backlinked IDs
 
       pushDb(PEN_TEST);  // existence check
-      // inside transaction:
-      pushDb({ findingId: "find-scan-1" }, { findingId: "find-scan-2" });  // junction read
+      // inside transaction: both junction rows have backlinkFinding=false
+      pushDb(JUNCTION_OWNED, { findingId: "find-scan-2", backlinkFinding: false });
       pushDb();          // delete(obsPenTests).where()
       pushDb();          // delete(obsFindings).where() — removes the 2 findings
       pushDb();          // audit
@@ -240,18 +325,56 @@ describe("observatory module routes — pen test delete", () => {
       expect(dbQ).toHaveLength(0);
     });
 
-    it("removes findings atomically — all steps run in a single transaction", async () => {
-      // The transaction mock passes the same db object through, so all queue
-      // entries are consumed in the expected order. This test verifies that
-      // removing the db.transaction() wrapper (e.g. reverting to sequential
-      // awaits) would still consume the same queue — the important property is
-      // that the transaction is used at all, giving the DB atomicity guarantee.
+    it("does NOT delete backlinked findings when the pen test is removed", async () => {
+      // Safety guarantee: backfilled junction rows (backlinkFinding=true) must not
+      // cause the underlying obs_findings row to be deleted when the pen test is
+      // removed. Those findings belong to the assessment, not exclusively the pen test.
       //
+      // When all junction rows are backlinked the ids list is empty after filtering,
+      // so the explicit findings DELETE is skipped (3 tx steps rather than 4,
+      // same as the no-findings case).
+
+      pushDb(PEN_TEST);           // existence check
+      // inside transaction: one owned + one backlinked
+      pushDb(JUNCTION_OWNED, JUNCTION_BACKLINK);
+      pushDb();                   // delete(obsPenTests).where()
+      // findings delete is still issued — for the one owned finding only
+      pushDb();                   // delete(obsFindings) for ids=["find-scan-1"]
+      pushDb();                   // audit
+
+      const res = await request(app).delete("/api/observatory/pen-tests/pt-1");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ success: true });
+      expect(dbQ).toHaveLength(0);
+    });
+
+    it("skips the findings DELETE entirely when all junction rows are backlinked", async () => {
+      // When every junction row has backlinkFinding=true the ids list is empty,
+      // so the explicit delete(obsFindings) call is skipped (4 entries total,
+      // same as the no-findings case).
+
+      pushDb(PEN_TEST);            // existence check
+      pushDb(JUNCTION_BACKLINK);   // all backlinked — ids=[]
+      pushDb();                    // delete(obsPenTests).where()
+      // NO delete(obsFindings) — ids.length === 0
+      pushDb();                    // audit
+
+      const res = await request(app).delete("/api/observatory/pen-tests/pt-1");
+
+      expect(res.status).toBe(200);
+      expect(dbQ).toHaveLength(0);
+    });
+
+    it("removes findings atomically — all steps run in a single transaction", async () => {
       // Verified by counting queue consumption: exactly 5 entries for a pen test
-      // with 2 findings (existence check + 3 tx steps + audit).
+      // with 2 owned findings (existence check + 3 tx steps + audit).
 
       pushDb(PEN_TEST);
-      pushDb({ findingId: SCAN_FINDING.id }, { findingId: SCAN_FINDING_2.id });
+      pushDb(
+        { findingId: SCAN_FINDING.id,   backlinkFinding: false },
+        { findingId: SCAN_FINDING_2.id, backlinkFinding: false },
+      );
       pushDb();   // delete pen test
       pushDb();   // delete findings
       pushDb();   // audit

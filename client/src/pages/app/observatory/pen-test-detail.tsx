@@ -13,7 +13,7 @@ import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useUser } from "@/lib/userContext";
 import { Link, useParams } from "wouter";
-import { ArrowLeft, Loader2, Plus, ScanLine, Trash2 } from "lucide-react";
+import { ArrowLeft, Link2, Loader2, Plus, ScanLine, Trash2 } from "lucide-react";
 import {
   PEN_TEST_RESULTS,
   VALIDATION_STATUSES,
@@ -145,6 +145,21 @@ export default function ObservatoryPenTestDetail() {
       toast({ title: "Finding deleted" });
     },
     onError: (err: Error) => toast({ title: "Delete failed", description: err.message, variant: "destructive" }),
+  });
+
+  const relinkFindingsMutation = useMutation({
+    mutationFn: async () =>
+      (await apiRequest("POST", `/api/observatory/pen-tests/${id}/relink-findings`)).json() as Promise<{ relinked: number; message?: string }>,
+    onSuccess: (data) => {
+      invalidate();
+      toast({
+        title: data.relinked > 0 ? `${data.relinked} finding(s) recovered` : "No orphaned findings",
+        description: data.relinked > 0
+          ? `${data.relinked} finding(s) from the shared register have been linked to this pen test.`
+          : (data.message ?? "All findings are already linked."),
+      });
+    },
+    onError: (err: Error) => toast({ title: "Recovery failed", description: err.message, variant: "destructive" }),
   });
 
   const triggerScanMutation = useMutation({
@@ -305,9 +320,24 @@ export default function ObservatoryPenTestDetail() {
         <div className="flex items-center justify-between gap-4">
           <h2 className="text-lg font-medium" data-testid="text-pen-findings-title">Findings</h2>
           {canWrite && (
-            <Button size="sm" onClick={() => setFindingDialogOpen(true)} data-testid="button-new-pen-finding">
-              <Plus className="h-4 w-4 mr-2" /> Add finding
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => relinkFindingsMutation.mutate()}
+                disabled={relinkFindingsMutation.isPending}
+                title="Recover findings from older scans that are missing their pen test link"
+                data-testid="button-relink-findings"
+              >
+                {relinkFindingsMutation.isPending
+                  ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Recovering…</>
+                  : <><Link2 className="h-4 w-4 mr-2" />Recover orphaned findings</>
+                }
+              </Button>
+              <Button size="sm" onClick={() => setFindingDialogOpen(true)} data-testid="button-new-pen-finding">
+                <Plus className="h-4 w-4 mr-2" /> Add finding
+              </Button>
+            </div>
           )}
         </div>
 

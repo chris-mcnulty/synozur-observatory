@@ -132,6 +132,18 @@ export function severityFromCvss(score: number): (typeof OBS_FINDING_SEVERITIES)
   return "Informational";
 }
 
+/** Reasonable default CVSS score when a finding has no explicit score. */
+function defaultCvssForSeverity(severity: string): number {
+  switch (severity) {
+    case "Critical":      return 9.0;
+    case "High":          return 7.5;
+    case "Medium":        return 5.0;
+    case "Low":           return 2.0;
+    case "Informational": return 0.0;
+    default:              return 5.0;
+  }
+}
+
 async function getTenantAssessment(ctx: RequestContext, assessmentId: string) {
   const [assessment] = await db
     .select()
@@ -639,14 +651,22 @@ export function registerObservatoryModuleRoutes(app: Express) {
       //   obs_findings.assessmentId        → onDelete: "cascade"  (handles assessment-scoped deletes)
       // Deleting the pen test alone cascades only the junction rows, leaving the
       // underlying obs_findings rows alive. They must be removed explicitly.
+      //
+      // IMPORTANT: backlinked findings (backlinkFinding = true, created by the
+      // relink-findings backfill endpoint) are NOT deleted. Those findings belong
+      // to the assessment, not exclusively to the pen test — they should remain in
+      // the shared register after the pen test is removed.
       const findingIds = await db.transaction(async (tx) => {
         // Collect obs_findings IDs while inside the transaction so the read and
         // the subsequent deletes are atomic — no partial cleanup on DB failure.
+        // Exclude backlinked findings from the explicit delete list.
         const ptFindingRows = await tx
-          .select({ findingId: obsPenTestFindings.findingId })
+          .select({ findingId: obsPenTestFindings.findingId, backlinkFinding: obsPenTestFindings.backlinkFinding })
           .from(obsPenTestFindings)
           .where(eq(obsPenTestFindings.penTestId, penTestId));
-        const ids = ptFindingRows.map((r) => r.findingId);
+        // Only delete findings that were originally created for this pen test
+        // (backlinkFinding = false). Backfilled findings survive the deletion.
+        const ids = ptFindingRows.filter((r) => !r.backlinkFinding).map((r) => r.findingId);
 
         // Delete the pen test — cascades obs_pen_test_findings rows via penTestId FK.
         // Any concurrent scanner that inserted a new finding + junction row after
@@ -1047,6 +1067,103 @@ export function registerObservatoryModuleRoutes(app: Express) {
       res.status(202).json({ status: "queued", message: "Security scan started" });
     } catch (err) {
       handleError(res, err, "security scan");
+    }
+  });
+
+  /**
+   * POST /api/observatory/pen-tests/:id/relink-findings
+   *
+   * One-time backfill: finds obs_findings rows that belong to this pen test's
+   * assessment but have no obs_pen_test_findings junction row, and inserts the
+   * missing junction rows.  Safe to call multiple times — uses onConflictDoNothing.
+   */
+  app.post("/api/observatory/pen-tests/:id/relink-findings", async (req, res) => {
+    const ctx = await ctxOr401(req, res);
+    if (!ctx) return;
+    if (!canWrite(ctx)) return res.status(403).json({ message: "Insufficient permissions" });
+    try {
+      const [penTest] = await db
+        .select()
+        .from(obsPenTests)
+        .where(and(eq(obsPenTests.id, req.params.id), eq(obsPenTests.tenantDomain, ctx.tenantDomain)));
+      if (!penTest) return res.status(404).json({ message: "Pen test not found" });
+
+      // Find obs_findings for this pen test's assessment that were created by the
+      // automated scan runner (runObservatoryScan) but are missing a junction row.
+      //
+      // Provenance criterion — scan-runner findings have an obs_finding_evidence row
+      // linking to the SAME evidence that is also linked to this assessment via
+      // obs_assessment_evidence, with evidenceType = 'scan_report'.
+      //
+      // Why this combination is reliable as a discriminator:
+      //   • runObservatoryScan creates one scan_report obs_evidence per run, links it
+      //     to the assessment (obsAssessmentEvidence) AND to each finding it creates
+      //     (obsFindingEvidence) — atomically, in the same code path.
+      //   • Manually created findings (pen test UI, general /api/observatory/findings
+      //     route) have no scan_report evidence linked to them, so they are excluded.
+      //   • Non-pen-test scan findings (accessibility, performance) have different
+      //     assessmentIds and are already excluded by the assessmentId equality check.
+      //
+      // Deletion safety: junction rows created here have backlinkFinding = true.
+      // The pen test deletion route only explicitly removes obs_findings rows where
+      // the junction row has backlinkFinding = false, so backfilled findings survive
+      // a pen test deletion and remain in the shared assessment register.
+      const orphaned = await db
+        .select({ id: obsFindings.id, severity: obsFindings.severity })
+        .from(obsFindings)
+        .where(
+          and(
+            eq(obsFindings.assessmentId, penTest.assessmentId),
+            eq(obsFindings.tenantDomain, ctx.tenantDomain),
+            // Provenance: finding must share a scan_report evidence with its assessment
+            sql`EXISTS (
+              SELECT 1
+              FROM   obs_finding_evidence ofe
+              JOIN   obs_assessment_evidence oae ON oae.evidence_id = ofe.evidence_id
+              JOIN   obs_evidence oe ON oe.id = ofe.evidence_id
+              WHERE  ofe.finding_id     = ${obsFindings.id}
+                AND  oae.assessment_id  = ${penTest.assessmentId}
+                AND  oe.evidence_type   = 'scan_report'
+            )`,
+            // Not already linked to any pen test
+            sql`NOT EXISTS (
+              SELECT 1 FROM obs_pen_test_findings ptf
+              WHERE ptf.finding_id = ${obsFindings.id}
+            )`,
+          ),
+        );
+
+      if (orphaned.length === 0) {
+        return res.json({ relinked: 0, message: "All findings are already linked to this pen test." });
+      }
+
+      // Insert missing junction rows, marked backlinkFinding = true so the
+      // pen test deletion route knows NOT to delete the underlying obs_findings.
+      await db
+        .insert(obsPenTestFindings)
+        .values(
+          orphaned.map((f) => ({
+            tenantDomain: ctx.tenantDomain,
+            penTestId: penTest.id,
+            findingId: f.id,
+            cvssScore: defaultCvssForSeverity(f.severity ?? "Medium"),
+            validationStatus: "Not Started" as const,
+            backlinkFinding: true,
+          })),
+        )
+        .onConflictDoNothing();
+
+      await audit(
+        ctx,
+        "pen_test",
+        penTest.id,
+        "relink_findings",
+        `Relinked ${orphaned.length} orphaned finding(s) to pen test`,
+      );
+
+      res.json({ relinked: orphaned.length });
+    } catch (err) {
+      handleError(res, err, "relink findings");
     }
   });
 
