@@ -446,7 +446,7 @@ export function isHeadlessAvailable(): boolean {
 export async function runInPage<T>(
   url: string,
   callback: (page: Page) => Promise<T>,
-  options: { waitTime?: number; timeout?: number; ssrfProtect?: boolean } = {},
+  options: { waitTime?: number; timeout?: number; ssrfProtect?: boolean; waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2" } = {},
 ): Promise<T | null> {
   await acquireCrawlSlot();
   try {
@@ -502,9 +502,9 @@ process.on("SIGTERM", async () => {
 async function _runInPageInner<T>(
   url: string,
   callback: (page: Page) => Promise<T>,
-  options: { waitTime?: number; timeout?: number; ssrfProtect?: boolean } = {},
+  options: { waitTime?: number; timeout?: number; ssrfProtect?: boolean; waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2" } = {},
 ): Promise<T | null> {
-  const { waitTime = 2000, timeout = 30000, ssrfProtect = false } = options;
+  const { waitTime = 2000, timeout = 30000, ssrfProtect = false, waitUntil = "networkidle2" } = options;
   let page: Page | null = null;
   try {
     const browser = await getBrowser();
@@ -515,7 +515,7 @@ async function _runInPageInner<T>(
     if (ssrfProtect) {
       await setupNavigationSsrfGuard(page);
     }
-    await page.goto(url, { waitUntil: "networkidle2", timeout });
+    await page.goto(url, { waitUntil, timeout });
     await delay(waitTime);
     const result = await callback(page);
     await page.close();

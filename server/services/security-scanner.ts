@@ -623,7 +623,7 @@ async function checkSensitivePaths(
 export const securityScanner: ScannerProvider = {
   key: "builtin_security",
   name: "Built-in Security Scanner",
-  assessmentTypes: ["security", "pen_test"],
+  assessmentTypes: ["security", "pen_test", "penetration_test"],
 
   async isAvailable(_tenantDomain: string): Promise<boolean> {
     return true; // Always available — no external dependencies

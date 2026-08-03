@@ -225,7 +225,7 @@ export const axeCoreScanner: ScannerProvider = {
           });
         });
       },
-      { waitTime: 1500, timeout: 45000, ssrfProtect: true },
+      { waitTime: 1500, timeout: 45000, ssrfProtect: true, waitUntil: "domcontentloaded" },
     );
 
     if (!scanResult) {
