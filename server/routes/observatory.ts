@@ -576,7 +576,7 @@ export function registerObservatoryRoutes(app: Express) {
           const scanLabel = `scan:${created.type}:${assessmentId}`;
           enqueueScan(
             scanLabel,
-            async () => runObservatoryScan({ assessmentId, tenantDomain: ctx.tenantDomain, triggeredByUserId: ctx.userId }),
+            async (signal) => runObservatoryScan({ assessmentId, tenantDomain: ctx.tenantDomain, triggeredByUserId: ctx.userId, signal }),
             { ctx: { tenantDomain: ctx.tenantDomain, targetId: assessmentId } },
           ).catch((err) => {
             console.error(`[Observatory] Auto-triggered scan failed for ${assessmentId}:`, err);
@@ -1300,7 +1300,7 @@ export function registerObservatoryRoutes(app: Express) {
     // Enqueue — don't await; the job runs in the background
     enqueueScan(
       scanLabel,
-      async () => runObservatoryScan({ assessmentId, tenantDomain: ctx.tenantDomain, triggeredByUserId: ctx.userId }),
+      async (signal) => runObservatoryScan({ assessmentId, tenantDomain: ctx.tenantDomain, triggeredByUserId: ctx.userId, signal }),
       { ctx: { tenantDomain: ctx.tenantDomain, targetId: assessmentId } },
     ).catch((err) => {
       console.error(`[observatory] scan job failed for ${assessmentId}:`, err);

@@ -128,12 +128,28 @@ const crawlWaitQueue: Array<() => void> = [];
 // app shell, making multi-page crawls both content-poor and nondeterministic
 // (a different subset of pages won the race each run, causing false "change"
 // alerts). Queuing guarantees every page is actually rendered.
-async function acquireCrawlSlot(): Promise<void> {
+async function acquireCrawlSlot(signal?: AbortSignal): Promise<void> {
   if (activeCrawls < MAX_CONCURRENT_CRAWLS) {
     activeCrawls++;
     return;
   }
-  await new Promise<void>((resolve) => crawlWaitQueue.push(resolve));
+  await new Promise<void>((resolve, reject) => {
+    // If the job was already aborted before we even started waiting, bail immediately.
+    if (signal?.aborted) {
+      reject(new Error("Scan aborted while waiting for a browser slot"));
+      return;
+    }
+    const onAbort = () => {
+      const idx = crawlWaitQueue.indexOf(resolve);
+      if (idx !== -1) crawlWaitQueue.splice(idx, 1);
+      reject(new Error("Scan aborted while waiting for a browser slot"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    crawlWaitQueue.push(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    });
+  });
   // Slot ownership was handed directly to us by releaseCrawlSlot (activeCrawls
   // was left incremented on our behalf), so we do not increment again here.
 }
@@ -446,9 +462,9 @@ export function isHeadlessAvailable(): boolean {
 export async function runInPage<T>(
   url: string,
   callback: (page: Page) => Promise<T>,
-  options: { waitTime?: number; timeout?: number; ssrfProtect?: boolean; waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2" } = {},
+  options: { waitTime?: number; timeout?: number; ssrfProtect?: boolean; waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2"; signal?: AbortSignal } = {},
 ): Promise<T | null> {
-  await acquireCrawlSlot();
+  await acquireCrawlSlot(options.signal);
   try {
     return await _runInPageInner(url, callback, options);
   } finally {
@@ -502,9 +518,11 @@ process.on("SIGTERM", async () => {
 async function _runInPageInner<T>(
   url: string,
   callback: (page: Page) => Promise<T>,
-  options: { waitTime?: number; timeout?: number; ssrfProtect?: boolean; waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2" } = {},
+  options: { waitTime?: number; timeout?: number; ssrfProtect?: boolean; waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2"; signal?: AbortSignal } = {},
 ): Promise<T | null> {
-  const { waitTime = 2000, timeout = 30000, ssrfProtect = false, waitUntil = "networkidle2" } = options;
+  const { waitTime = 2000, timeout = 30000, ssrfProtect = false, waitUntil = "networkidle2", signal } = options;
+  // Bail immediately if already cancelled before the browser even opens
+  if (signal?.aborted) return null;
   let page: Page | null = null;
   try {
     const browser = await getBrowser();

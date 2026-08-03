@@ -157,15 +157,20 @@ export async function validateUrlWithDnsCheck(urlString: string): Promise<UrlVal
 
   try {
     let resolvedIPs: string[] = [];
-    
+
+    // Wrap each DNS call with a 5-second timeout so a slow/unresponsive DNS
+    // server does not stall the caller (e.g. a scan job) indefinitely.
+    const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
+      Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error("DNS timeout")), ms))]);
+
     try {
-      const ipv4s = await dnsResolve4(hostname);
+      const ipv4s = await withTimeout(dnsResolve4(hostname), 5000);
       resolvedIPs = resolvedIPs.concat(ipv4s);
     } catch {
     }
 
     try {
-      const ipv6s = await dnsResolve6(hostname);
+      const ipv6s = await withTimeout(dnsResolve6(hostname), 5000);
       resolvedIPs = resolvedIPs.concat(ipv6s);
     } catch {
     }

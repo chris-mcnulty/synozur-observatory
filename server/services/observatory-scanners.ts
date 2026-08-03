@@ -60,6 +60,8 @@ export interface ScanRequest {
   };
   /** Provider-specific options (rulesets, depth, auth, etc.). */
   options?: Record<string, unknown>;
+  /** Job-queue AbortSignal — propagate to long-running I/O so cancelled jobs release resources promptly. */
+  signal?: AbortSignal;
 }
 
 export interface ScanResult {

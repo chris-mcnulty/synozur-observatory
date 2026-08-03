@@ -31,6 +31,8 @@ export interface ScanRunOptions {
   tenantDomain: string;
   /** User ID who triggered the scan (for audit / createdBy). */
   triggeredByUserId?: string;
+  /** Job-queue AbortSignal — passed through to the scanner so it can release resources when the job times out. */
+  signal?: AbortSignal;
 }
 
 export interface ScanRunResult {
@@ -101,7 +103,7 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
   };
 
   console.log(`[ScanRunner] Starting ${scanner.key} scan for assessment ${assessmentId} (${assessment.type}) → ${targetUrl}`);
-  const result = await scanner.runScan(request);
+  const result = await scanner.runScan({ ...request, signal: opts.signal });
 
   // ── 5. Persist raw report as evidence (including full JSON body) ────────────
   let evidenceId: string | null = null;
