@@ -22,6 +22,8 @@ import {
   obsFindingEvidence,
   obsReviewItems,
   obsReviewItemFindings,
+  obsPenTests,
+  obsPenTestFindings,
 } from "@shared/schema";
 import { findScannerForType } from "./observatory-scanners";
 import type { ScanRequest } from "./observatory-scanners";
@@ -147,6 +149,17 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
     existingFindings.map(f => `${f.title}|${f.affectedComponent ?? ""}`),
   );
 
+  // For penetration_test assessments, look up the linked pen test so we can
+  // create obs_pen_test_findings junction rows alongside each new finding.
+  let penTestId: string | null = null;
+  if (assessment.type === "penetration_test") {
+    const [pt] = await db
+      .select({ id: obsPenTests.id })
+      .from(obsPenTests)
+      .where(and(eq(obsPenTests.assessmentId, assessmentId), eq(obsPenTests.tenantDomain, tenantDomain)));
+    penTestId = pt?.id ?? null;
+  }
+
   // For accessibility assessments, pre-load review items to link findings
   const reviewItemsByCategory = new Map<string, string>();
   if (assessment.type === "accessibility") {
@@ -194,6 +207,17 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
       })
       .returning({ id: obsFindings.id });
 
+    // For pen tests: create the junction row so the finding shows in the pen test detail.
+    if (penTestId) {
+      await db.insert(obsPenTestFindings).values({
+        tenantDomain,
+        penTestId,
+        findingId: inserted.id,
+        cvssScore: defaultCvssForSeverity(finding.severity),
+        validationStatus: "Not Started",
+      }).onConflictDoNothing();
+    }
+
     // Link raw scan evidence to each finding
     if (evidenceId) {
       await db.insert(obsFindingEvidence).values({
@@ -230,6 +254,18 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
   );
 
   return { findingsCreated, findingsSkipped, evidenceId, tool: result.tool, durationMs };
+}
+
+/** Reasonable default CVSS score when a scan finding has no explicit score. */
+function defaultCvssForSeverity(severity: string): number {
+  switch (severity) {
+    case "Critical":      return 9.0;
+    case "High":          return 7.5;
+    case "Medium":        return 5.0;
+    case "Low":           return 2.0;
+    case "Informational": return 0.0;
+    default:              return 5.0;
+  }
 }
 
 function mapDomain(assessmentType: string): string {
