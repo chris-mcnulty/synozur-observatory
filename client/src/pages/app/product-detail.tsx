@@ -946,39 +946,6 @@ export default function ProductDetail() {
     },
   });
 
-  const [scanningProductId, setScanningProductId] = useState<string | null>(null);
-
-  const scanProduct = useMutation({
-    mutationFn: async (productId: string) => {
-      setScanningProductId(productId);
-      const response = await fetch(`/api/products/${productId}/scan`, {
-        method: "POST",
-        credentials: "include",
-      });
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error || "Failed to scan product");
-      }
-      return response.json();
-    },
-    onSuccess: (data) => {
-      queryClient.invalidateQueries({ queryKey: ["/api/projects", id, "products"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
-      setScanningProductId(null);
-      toast({
-        title: "Product Scanned",
-        description: `Successfully analyzed ${data.pagesScanned || 0} pages from the product website.`,
-      });
-    },
-    onError: (error: Error) => {
-      setScanningProductId(null);
-      toast({
-        title: "Scan Failed",
-        description: error.message,
-        variant: "destructive",
-      });
-    },
-  });
 
   const openEditDialog = (product: Product) => {
     setEditingProduct(product);
@@ -1891,22 +1858,6 @@ export default function ProductDetail() {
                             )}
                           </div>
                           <div className="flex gap-1">
-                            {pp.product.url && (
-                              <Button 
-                                variant="ghost" 
-                                size="icon"
-                                onClick={() => scanProduct.mutate(pp.productId)}
-                                disabled={scanningProductId === pp.productId}
-                                title="Scan website"
-                                data-testid={`button-scan-${pp.productId}`}
-                              >
-                                {scanningProductId === pp.productId ? (
-                                  <Loader2 className="h-4 w-4 animate-spin" />
-                                ) : (
-                                  <RefreshCw className="h-4 w-4" />
-                                )}
-                              </Button>
-                            )}
                             <Button 
                               variant="ghost" 
                               size="icon"
