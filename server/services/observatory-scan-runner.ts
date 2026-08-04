@@ -92,11 +92,29 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
   }
 
   // ── 3. Mark assessment in_progress ───────────────────────────────────────
+  // Remember the prior status so a failed/timed-out scan can restore it instead
+  // of leaving the assessment stuck "in_progress" forever.
+  const priorStatus = assessment.status;
   await db
     .update(obsAssessments)
     .set({ status: "in_progress", updatedAt: new Date() })
     .where(eq(obsAssessments.id, assessmentId));
 
+  try {
+    return await executeScan();
+  } catch (err) {
+    // Restore the pre-scan status (falling back to "planned" if the assessment
+    // was already in_progress) so the UI doesn't show a scan that never ends.
+    const restoreTo = priorStatus === "in_progress" ? "planned" : priorStatus;
+    await db
+      .update(obsAssessments)
+      .set({ status: restoreTo, updatedAt: new Date() })
+      .where(eq(obsAssessments.id, assessmentId))
+      .catch(() => {});
+    throw err;
+  }
+
+  async function executeScan(): Promise<ScanRunResult> {
   // ── 4. Run scan ───────────────────────────────────────────────────────────
   const request: ScanRequest = {
     tenantDomain,
@@ -320,6 +338,7 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
   );
 
   return { findingsCreated, findingsSkipped, findingsResolved, evidenceId, tool: result.tool, durationMs };
+  }
 }
 
 /** Reasonable default CVSS score when a scan finding has no explicit score. */

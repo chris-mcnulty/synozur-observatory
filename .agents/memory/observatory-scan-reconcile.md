@@ -12,3 +12,6 @@ Both scan paths (general `observatory-scan-runner.ts` and pen-test route) reconc
 
 **Why:** re-scans previously duplicated findings (dedup key mismatch: null affectedComponent) and re-opened human-remediated rows; manual findings must never be auto-closed.
 **How to apply:** any new scanner or scan-ingest path must follow this contract; findings it creates must set scanRuleId.
+
+## Production scan hangs (Autoscale)
+Accessibility scans in the published app (Autoscale) always die with "Timed out after 300s" — headless-Chromium background jobs get throttled CPU outside request handling; the target site itself is fast. `scheduled_job_runs` (query prod read-only) is the ground truth for scan job outcomes; scan-status polling is in-memory only and lies after instance recycles. Scan failures must restore assessment status (runner now restores prior status) or assessments stay "in_progress" forever. Real fix likely = Reserved VM deployment.
