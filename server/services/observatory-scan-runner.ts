@@ -12,7 +12,7 @@
  */
 
 import { db } from "../db";
-import { eq, and } from "drizzle-orm";
+import { eq, and, inArray } from "drizzle-orm";
 import {
   obsAssessments,
   obsApplications,
@@ -40,6 +40,7 @@ export interface ScanRunOptions {
 export interface ScanRunResult {
   findingsCreated: number;
   findingsSkipped: number;
+  findingsResolved: number;
   evidenceId: string | null;
   tool: string;
   durationMs: number;
@@ -138,16 +139,27 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
     }).onConflictDoNothing();
   }
 
-  // ── 6. Write findings (dedup by title + selector within this assessment) ────
+  // ── 6. Reconcile findings (update existing, insert new, auto-resolve fixed) ──
   const existingFindings = await db
-    .select({ title: obsFindings.title, affectedComponent: obsFindings.affectedComponent })
+    .select({
+      id: obsFindings.id,
+      title: obsFindings.title,
+      affectedComponent: obsFindings.affectedComponent,
+      status: obsFindings.status,
+      scanRuleId: obsFindings.scanRuleId,
+    })
     .from(obsFindings)
     .where(and(eq(obsFindings.assessmentId, assessmentId), eq(obsFindings.tenantDomain, tenantDomain)));
 
-  // Consistent dedup key: title|selector — same key used when inserting below
-  const existingKeys = new Set(
-    existingFindings.map(f => `${f.title}|${f.affectedComponent ?? ""}`),
+  // Primary match: scanRuleId|selector. Fallback: title|selector (legacy rows
+  // created before scanRuleId existed — matched once, then backfilled).
+  const existingByRuleKey = new Map(
+    existingFindings.filter(f => f.scanRuleId != null).map(f => [`${f.scanRuleId}|${f.affectedComponent ?? ""}`, f]),
   );
+  const existingByTitleKey = new Map(
+    existingFindings.filter(f => f.scanRuleId == null).map(f => [`${f.title}|${f.affectedComponent ?? ""}`, f]),
+  );
+  const matchedFindingIds = new Set<string>();
 
   // For penetration_test assessments, look up the linked pen test so we can
   // create obs_pen_test_findings junction rows alongside each new finding.
@@ -174,17 +186,50 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
 
   let findingsCreated = 0;
   let findingsSkipped = 0;
+  let findingsResolved = 0;
+
+  // Scan-side dedup: identical rule|selector results within one scan are processed once.
+  const seenScanKeys = new Set<string>();
+  // "target-unreachable" is a synthetic finding some scanners emit instead of
+  // throwing. Treat it as a failed scan: never auto-resolve other findings.
+  const scanUnreachable = result.findings.some((f) => f.ruleId === "target-unreachable");
 
   for (const finding of result.findings) {
     const selector = finding.location?.selector ?? finding.location?.file ?? "";
-    const dedupKey = `${finding.title}|${selector}`;
-    if (existingKeys.has(dedupKey)) {
+    const ruleKey = `${finding.ruleId}|${selector}`;
+    if (seenScanKeys.has(ruleKey)) {
       findingsSkipped++;
       continue;
     }
-    existingKeys.add(dedupKey);
+    seenScanKeys.add(ruleKey);
 
-    const [inserted] = await db
+    const titleKey = `${finding.title}|${selector}`;
+    const existing = existingByRuleKey.get(ruleKey) ?? existingByTitleKey.get(titleKey);
+
+    let findingId: string;
+    if (existing) {
+      // Consume the row so it can only match one scan result.
+      existingByRuleKey.delete(ruleKey);
+      existingByTitleKey.delete(titleKey);
+      // Already known — refresh metadata but NEVER override a human decision.
+      // remediated / accepted_risk / false_positive / in_progress stay untouched.
+      matchedFindingIds.add(existing.id);
+      findingId = existing.id;
+      await db
+        .update(obsFindings)
+        .set({
+          description: finding.description ?? null,
+          severity: finding.severity,
+          wcagCriterion: finding.wcagCriterion ?? null,
+          cweId: finding.cweId ?? null,
+          // Backfill scanRuleId on legacy rows so future scans match by rule.
+          scanRuleId: finding.ruleId,
+          updatedAt: new Date(),
+        })
+        .where(eq(obsFindings.id, existing.id));
+      findingsSkipped++;
+    } else {
+      const [inserted] = await db
       .insert(obsFindings)
       .values({
         tenantDomain,
@@ -200,19 +245,26 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
         wcagCriterion: finding.wcagCriterion ?? null,
         cweId: finding.cweId ?? null,
         sourceLine: finding.location?.line ?? null,
+        scanRuleId: finding.ruleId,
         stepsToReproduce: finding.location?.url
           ? `URL: ${finding.location.url}${finding.location.selector ? `\nSelector: ${finding.location.selector}` : ""}`
           : null,
         createdBy: triggeredByUserId ?? null,
       })
       .returning({ id: obsFindings.id });
+      findingId = inserted.id;
+      findingsCreated++;
+    }
+
+    // Associations run for BOTH inserted and matched findings so legacy rows
+    // missing junction/evidence/review links get repaired idempotently.
 
     // For pen tests: create the junction row so the finding shows in the pen test detail.
     if (penTestId) {
       await db.insert(obsPenTestFindings).values({
         tenantDomain,
         penTestId,
-        findingId: inserted.id,
+        findingId,
         cvssScore: defaultCvssForSeverity(finding.severity),
         validationStatus: "Not Started",
       }).onConflictDoNothing();
@@ -221,7 +273,7 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
     // Link raw scan evidence to each finding
     if (evidenceId) {
       await db.insert(obsFindingEvidence).values({
-        findingId: inserted.id,
+        findingId,
         evidenceId,
       }).onConflictDoNothing();
     }
@@ -233,12 +285,26 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
       if (category && reviewItemsByCategory.has(category)) {
         await db.insert(obsReviewItemFindings).values({
           reviewItemId: reviewItemsByCategory.get(category)!,
-          findingId: inserted.id,
+          findingId,
         }).onConflictDoNothing();
       }
     }
+  }
 
-    findingsCreated++;
+  // ── 6b. Auto-resolve scan findings no longer detected ──────────────────────
+  // Only rows this scanner previously created (scanRuleId set) AND still "open"
+  // are auto-resolved. Human-set statuses and manual findings are never touched.
+  // Skipped entirely when the target was unreachable — a transient outage must
+  // not mass-close real findings.
+  const staleOpenIds = scanUnreachable ? [] : existingFindings
+    .filter((f) => f.scanRuleId != null && f.status === "open" && !matchedFindingIds.has(f.id))
+    .map((f) => f.id);
+  if (staleOpenIds.length > 0) {
+    await db
+      .update(obsFindings)
+      .set({ status: "remediated", resolvedAt: new Date(), updatedAt: new Date() })
+      .where(inArray(obsFindings.id, staleOpenIds));
+    findingsResolved = staleOpenIds.length;
   }
 
   // ── 7. Mark assessment completed ─────────────────────────────────────────
@@ -250,10 +316,10 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
   const durationMs = Date.now() - started;
   console.log(
     `[ScanRunner] Completed ${scanner.key} for ${assessmentId}: ` +
-    `${findingsCreated} findings created, ${findingsSkipped} skipped, ${Math.round(durationMs / 1000)}s`,
+    `${findingsCreated} findings created, ${findingsSkipped} updated, ${findingsResolved} auto-resolved, ${Math.round(durationMs / 1000)}s`,
   );
 
-  return { findingsCreated, findingsSkipped, evidenceId, tool: result.tool, durationMs };
+  return { findingsCreated, findingsSkipped, findingsResolved, evidenceId, tool: result.tool, durationMs };
 }
 
 /** Reasonable default CVSS score when a scan finding has no explicit score. */

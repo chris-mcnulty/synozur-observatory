@@ -47,4 +47,5 @@
 - [Marketing calendar deep-link to undated posts](marketing-calendar-deeplink-undated.md) — undated ?post= targets live individually in the backlog query (not the rolled-up grid); highlight them in the rail, never drill an "unscheduled" batch.
 - [Drizzle correlated subquery counts](drizzle-correlated-subquery.md) — sql`` correlated count subqueries silently return 0; use leftJoin+groupBy instead and verify aggregates against direct SQL.
 - [Observatory workbenches](observatory-workbenches.md) — six modules on one table; pen-test findings wrap shared obs_findings; readiness weights/bands/blockers are a product contract; VPAT disclaimer mandatory.
+- [Observatory scan reconcile](observatory-scan-reconcile.md) — scans update/insert/auto-resolve by scanRuleId; never touch human statuses; skip auto-resolve on target-unreachable.
 - [E2E API auth verification](e2e-api-auth-verification.md) — preview is login-gated; verify via temp bcrypt password on e2e-test user + curl session + X-Active-Tenant-Id header; dev AI provider 404s (env, not code).

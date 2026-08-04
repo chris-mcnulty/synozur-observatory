@@ -128,6 +128,7 @@ vi.mock("../observatory-scan-runner", () => ({
   runObservatoryScan: vi.fn().mockResolvedValue({
     findingsCreated: 2,
     findingsSkipped: 0,
+    findingsResolved: 0,
     evidenceId: "ev-scan-1",
     tool: "axe-core",
     durationMs: 1200,
