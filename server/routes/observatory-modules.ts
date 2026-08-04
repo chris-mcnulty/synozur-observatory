@@ -894,9 +894,10 @@ export function registerObservatoryModuleRoutes(app: Express) {
           // findings — a transient outage should never clear the register.
           const scanFailed = scanResult.findings.some((f) => f.ruleId === "target-unreachable");
 
-          // Load ALL automated findings for this pen test (with OR without scanRuleId).
-          // Rows created before the migration have scanRuleId = NULL; we match those
-          // by title as a one-time backfill so they are not duplicated on first re-scan.
+          // Load ALL findings linked to this pen test, regardless of how they were created.
+          // Earlier scans via the general assessment runner set affectedComponent=null;
+          // filtering by affectedComponent="Automated Scan" would miss those rows and
+          // cause duplicate findings to be inserted on every subsequent pen-test scan.
           const existingRows = await db
             .select({
               penTestFindingId: obsPenTestFindings.id,
@@ -911,7 +912,6 @@ export function registerObservatoryModuleRoutes(app: Express) {
               and(
                 eq(obsPenTestFindings.penTestId, penTest.id),
                 eq(obsPenTestFindings.tenantDomain, penTest.tenantDomain),
-                eq(obsFindings.affectedComponent, "Automated Scan"),
               ),
             );
 
@@ -944,11 +944,11 @@ export function registerObservatoryModuleRoutes(app: Express) {
             try {
               const existing = existingByRuleId.get(sf.ruleId) ?? legacyByTitle.get(sf.title);
               if (existing) {
-                // Finding already exists (or is a matched legacy row) — update it.
-                // Re-open only if it was auto-remediated by the scanner (status
-                // "remediated"); preserve any manually-set status like "accepted_risk"
-                // or "in_progress".
-                const newStatus = existing.status === "remediated" ? "open" : existing.status;
+                // Finding already exists — update description/severity/rule metadata but
+                // NEVER override a human decision. "remediated", "accepted_risk",
+                // "false_positive", and "in_progress" are all preserved unchanged.
+                // Only leave "open" findings as "open"; everything else stays as-is.
+                const newStatus = existing.status === "open" ? "open" : existing.status;
                 await db
                   .update(obsFindings)
                   .set({
@@ -1016,9 +1016,11 @@ export function registerObservatoryModuleRoutes(app: Express) {
           if (!scanFailed) {
             const staleRuleIds = [...existingByRuleId.keys()].filter((rid) => !returnedRuleIds.has(rid));
             if (staleRuleIds.length > 0) {
+              // Only auto-resolve findings that are still "open" — never touch
+              // remediated, accepted_risk, false_positive, or in_progress rows.
               const staleFindingIds = staleRuleIds
                 .map((rid) => existingByRuleId.get(rid)!)
-                .filter((r) => r.status !== "remediated")
+                .filter((r) => r.status === "open")
                 .map((r) => r.findingId);
 
               if (staleFindingIds.length > 0) {
