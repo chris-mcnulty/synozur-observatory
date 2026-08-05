@@ -30,23 +30,40 @@ import PerformanceScanPanel from "./performance-scan";
 
 interface Detail {
   id: string;
+
   title: string;
+
   type: string;
+
   status: string;
+
   assessorName: string | null;
+
   team: string | null;
+
   startDate: string | null;
+
   endDate: string | null;
+
   overallScore: number | null;
+
   executiveSummary: string | null;
+
   scope: string | null;
+
   outOfScope: string | null;
+
   applicationId: string;
   /** Automated scan cadence — only relevant for performance assessments. */
+
   scanSchedule: "daily" | "weekly" | "disabled";
-  application: { id: string; name: string; appUrl?: string | null; perfSlaConfig?: SlaConfig | null } | null;
+
+  application: { id: string; name: string; appUrl?: string | null; perfSlaConfig?: SlaConfig | null; perfExtraUrls?: string[] | null } | null;
+
   version: { id: string; versionNumber: string } | null;
+
   findings: { id: string; title: string; severity: string; status: string; domain: string }[];
+
   evidence: { id: string; title: string; evidenceType: string }[];
 }
 
@@ -441,6 +458,7 @@ export default function ObservatoryAssessmentDetail() {
                 assessmentId={assessment.id}
                 applicationId={assessment.application.id}
                 applicationSlaConfig={assessment.application.perfSlaConfig ?? null}
+                applicationExtraUrls={assessment.application.perfExtraUrls ?? []}
                 scanSchedule={assessment.scanSchedule ?? "disabled"}
                 canWrite={canWrite}
               />
@@ -518,6 +536,7 @@ export default function ObservatoryAssessmentDetail() {
     </AppLayout>
   );
 }
+
 
 interface SlaConfig {
   ttfbMs: number;

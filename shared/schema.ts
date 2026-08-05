@@ -5035,6 +5035,8 @@ export const obsApplications = pgTable("obs_applications", {
   status: text("status").notNull().default("active"), // active, archived
   /** Optional custom SLA thresholds for performance scans. Falls back to platform defaults when null. */
   perfSlaConfig: jsonb("perf_sla_config"),
+  /** Extra page URLs to include in every performance scan beyond the primary appUrl (max 20). */
+  perfExtraUrls: text("perf_extra_urls").array(),
   createdBy: varchar("created_by").references(() => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
@@ -5782,7 +5784,27 @@ export const obsPerformanceScans = pgTable("obs_performance_scans", {
   assessmentIdx: index("obs_perf_scans_assessment_idx").on(t.assessmentId, t.createdAt),
 }));
 
-// ── Insert schemas + types ──────────────────────────────────────────────────
+export const obsPerformanceScanPages = pgTable("obs_performance_scan_pages", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  tenantDomain: text("tenant_domain").notNull(),
+  scanId: varchar("scan_id").notNull().references(() => obsPerformanceScans.id, { onDelete: "cascade" }),
+  /** URL scanned for this page. */
+  scanUrl: text("scan_url").notNull(),
+  status: text("status").notNull().default("running"), // running | completed | failed
+  ttfbMs: integer("ttfb_ms"),
+  loadTimeMs: integer("load_time_ms"),
+  lcpMs: integer("lcp_ms"),
+  clsScore: real("cls_score"),
+  ttiMs: integer("tti_ms"),
+  findingCount: integer("finding_count").notNull().default(0),
+  scanError: text("scan_error"),
+  warnings: jsonb("warnings").default(sql`'[]'::jsonb`),
+  scannedAt: timestamp("scanned_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (t) => ({
+  scanIdx: index("obs_perf_scan_pages_scan_idx").on(t.scanId),
+  tenantIdx: index("obs_perf_scan_pages_tenant_idx").on(t.tenantDomain, t.scanId),
+}));
 export const insertObsReadinessScoreSchema = createInsertSchema(obsReadinessScores).omit({ id: true, computedAt: true });
 export type ObsReadinessScore = typeof obsReadinessScores.$inferSelect;
 export type InsertObsReadinessScore = z.infer<typeof insertObsReadinessScoreSchema>;
@@ -5798,3 +5820,9 @@ export type InsertObsVpatEntry = z.infer<typeof insertObsVpatEntrySchema>;
 export const insertObsPerformanceScanSchema = createInsertSchema(obsPerformanceScans).omit({ id: true, createdAt: true });
 export type ObsPerformanceScan = typeof obsPerformanceScans.$inferSelect;
 export type InsertObsPerformanceScan = z.infer<typeof insertObsPerformanceScanSchema>;
+
+export const insertObsPerformanceScanPageSchema = createInsertSchema(obsPerformanceScanPages).omit({ id: true, createdAt: true });
+
+export type ObsPerformanceScanPage = typeof obsPerformanceScanPages.$inferSelect;
+
+export type InsertObsPerformanceScanPage = z.infer<typeof insertObsPerformanceScanPageSchema>;

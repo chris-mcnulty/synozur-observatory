@@ -379,7 +379,7 @@ export function enqueueScan<T>(
     priority: PRIORITY.scan,
     timeoutMs: options?.timeoutMs ?? 5 * 60 * 1000,
     ctx: options?.ctx,
-    maxRetries: options?.maxRetries ?? 1, // Scans are expensive — only one retry by default
+    maxRetries: options?.maxRetries ?? 1, // Scans are expensive — one retry by default
   });
 }
 

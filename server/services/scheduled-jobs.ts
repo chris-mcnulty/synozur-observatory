@@ -19,7 +19,11 @@ import { db } from "../db";
 import { marketingPlans, seoMetrics, trackedKeywords, collaborationComments, collaborationThreads, annotations, generatedPosts, scheduledJobRuns, obsAssessments, obsApplications, obsPerformanceScans, type SeoMetric } from "@shared/schema";
 import { eq, and, desc, isNull, lt, sql, inArray, ne } from "drizzle-orm";
 import { isPerfScanDue, runScheduledPerfScan } from "./perf-scan-schedule-core";
+import { enqueueMonitor } from "./job-queue";
 import type { SeoMover } from "./webhook-formatters";
+
+/** Minimum elapsed time before re-queuing a pricing monitor (7 days). */
+const PRICING_MIN_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Cache for market status to avoid repeated DB queries
 const marketStatusCache: Map<string, { status: string; timestamp: number }> = new Map();
@@ -66,7 +70,8 @@ async function trackJobStart(
   jobType: string,
   tenantDomain?: string,
   targetId?: string,
-  targetName?: string
+  targetName?: string,
+  jobLabel?: string,
 ): Promise<string> {
   try {
     // Job-lifecycle telemetry goes through the dedicated crawl pool, never the
@@ -79,6 +84,7 @@ async function trackJobStart(
         tenantDomain: tenantDomain || null,
         targetId: targetId || null,
         targetName: targetName || null,
+        jobLabel: jobLabel || null,
         status: "running",
         startedAt: new Date(),
       })
@@ -1405,7 +1411,7 @@ export async function runPerfScanSchedulerJob(): Promise<void> {
           continue;
         }
 
-        // Resolve the application URL.
+        // Resolve the application URL and extra pages.
         const [appRow] = await db
           .select()
           .from(obsApplications)
@@ -1421,13 +1427,25 @@ export async function runPerfScanSchedulerJob(): Promise<void> {
           continue;
         }
 
-        // SSRF guard — skip dangerous URLs rather than crashing the sweep.
+        // SSRF guard on primary URL — skip dangerous targets rather than crashing the sweep.
+        const { assertScanUrlSafe } = await import("./ssrf-guard");
         try {
-          const { assertScanUrlSafe } = await import("./ssrf-guard");
           await assertScanUrlSafe(url.trim());
         } catch {
           skippedNoUrl++;
           continue;
+        }
+
+        // Resolve and SSRF-validate extra URLs (silently drop any that fail).
+        const rawExtraUrls: string[] = ((appRow as any)?.perfExtraUrls as string[] | null) ?? [];
+        const extraUrls: string[] = [];
+        for (const u of rawExtraUrls) {
+          try {
+            await assertScanUrlSafe(u.trim());
+            extraUrls.push(u.trim());
+          } catch {
+            console.warn(`[PerfScan Scheduler] Skipping extra URL ${u} — SSRF check failed`);
+          }
         }
 
         // ── Stamp lastAutoScanAt before enqueuing (stamp-before pattern). ──
@@ -1466,6 +1484,7 @@ export async function runPerfScanSchedulerJob(): Promise<void> {
         const { enqueue } = await import("./job-queue");
         const { executePerfScan } = await import("../routes/observatory-performance");
 
+        const urlCount = 1 + extraUrls.length;
         await runScheduledPerfScan(
           tenant.domain,
           assessment.id,
@@ -1480,18 +1499,40 @@ export async function runPerfScanSchedulerJob(): Promise<void> {
             },
             scanRow,
             url: url.trim(),
+            extraUrls,
             slaConfig,
             scanSource: "scheduled",
             triggeredByUserId: null,
           }),
           {
-            startJobRun: trackJobStart,
-            completeJobRun: trackJobComplete,
             enqueue: (label, work, opts) =>
               enqueue("other", label, work, {
                 ...opts,
                 ctx: { tenantDomain: tenant.domain, targetId: assessment.id, targetName: assessment.title },
               }),
+          },
+          urlCount,
+          // Transition the batch row to "failed" if the queue rejects before
+          // work ever ran (infrastructure failure) or after all retries are
+          // exhausted. The WHERE status='running' guard makes this idempotent:
+          // if executePerfScan already marked the row failed, this is a no-op.
+          async () => {
+            // Mark the batch as failed if it's still running (idempotent: the
+            // WHERE status='running' guard is a no-op if executePerfScan already
+            // updated the row). Only update status and scanError — completedAt
+            // is not a column on obs_performance_scans.
+            await db
+              .update(obsPerformanceScans)
+              .set({
+                status: "failed",
+                scanError: "Scan queue rejected: all retries exhausted or queue infrastructure failure",
+              })
+              .where(
+                and(
+                  eq(obsPerformanceScans.id, scanRow.id),
+                  eq(obsPerformanceScans.status, "running"),
+                ),
+              );
           },
         );
 

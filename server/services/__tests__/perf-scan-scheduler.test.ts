@@ -4,6 +4,9 @@ import {
   isPerfScanDue,
   shouldSkipFinding,
   PERF_SCAN_INTERVAL_MS,
+  PERF_SCAN_TIMEOUT_PER_URL_MS,
+  runScheduledPerfScan,
+  type PerfScanScheduleDeps,
 } from "../perf-scan-schedule-core";
 
 // ── isPerfScanDue ────────────────────────────────────────────────────────────
@@ -162,6 +165,42 @@ describe("shouldSkipFinding", () => {
       shouldSkipFinding({ scanSource: "scheduled", ruleId: "Slow-TTFB", openRuleIds }),
       false,
     );
+  });
+});
+
+// ── runScheduledPerfScan — timeout scaling ────────────────────────────────────
+
+describe("runScheduledPerfScan timeout scaling", () => {
+  function makeDeps() {
+    const enqueuedOpts: { maxRetries: number; priority: number; timeoutMs: number }[] = [];
+    const deps: PerfScanScheduleDeps = {
+      enqueue: async (_label, _work, opts) => { enqueuedOpts.push(opts); },
+    };
+    return { deps, enqueuedOpts };
+  }
+
+  it("uses 1× timeout for a single URL (primary only)", async () => {
+    const { deps, enqueuedOpts } = makeDeps();
+    await runScheduledPerfScan("t1", "a1", "Test", async () => {}, deps, 1);
+    assert.equal(enqueuedOpts[0]?.timeoutMs, PERF_SCAN_TIMEOUT_PER_URL_MS);
+  });
+
+  it("doubles timeout for 2 URLs (primary + 1 extra)", async () => {
+    const { deps, enqueuedOpts } = makeDeps();
+    await runScheduledPerfScan("t1", "a1", "Test", async () => {}, deps, 2);
+    assert.equal(enqueuedOpts[0]?.timeoutMs, PERF_SCAN_TIMEOUT_PER_URL_MS * 2);
+  });
+
+  it("scales timeout for 5 URLs (primary + 4 extra)", async () => {
+    const { deps, enqueuedOpts } = makeDeps();
+    await runScheduledPerfScan("t1", "a1", "Test", async () => {}, deps, 5);
+    assert.equal(enqueuedOpts[0]?.timeoutMs, PERF_SCAN_TIMEOUT_PER_URL_MS * 5);
+  });
+
+  it("uses 1× timeout when urlCount is omitted (default)", async () => {
+    const { deps, enqueuedOpts } = makeDeps();
+    await runScheduledPerfScan("t1", "a1", "Test", async () => {}, deps);
+    assert.equal(enqueuedOpts[0]?.timeoutMs, PERF_SCAN_TIMEOUT_PER_URL_MS);
   });
 });
 

@@ -27,24 +27,19 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Loader2, Play, Settings, CheckCircle2, XCircle, Clock, AlertTriangle, CalendarClock, AlertCircle } from "lucide-react";
+import { Loader2, Play, Settings, CheckCircle2, XCircle, Clock, AlertTriangle, CalendarClock, AlertCircle, Globe, Link2, Trash2, Plus } from "lucide-react";
 import { formatDate } from "@/lib/utils";
 
 interface PerfScan {
   id: string;
   scanUrl: string;
   status: "running" | "completed" | "failed";
-  ttfbMs: number | null;
-  loadTimeMs: number | null;
-  lcpMs: number | null;
-  clsScore: number | null;
-  ttiMs: number | null;
   findingCount: number;
-  scanError: string | null;
-  warnings: string[];
-  scannedAt: string | null;
   createdAt: string;
   scanSource: "manual" | "scheduled";
+  slaConfig: SlaConfig | null;
+  triggeredBy: string | null;
+  pages: PerfScanPage[];
 }
 
 interface SlaConfig {
@@ -82,31 +77,50 @@ function metricStatus(value: number | null, threshold: number): "ok" | "breach" 
   return value <= threshold ? "ok" : "breach";
 }
 
-function MetricCell({ value, threshold, format }: { value: number | null; threshold: number; format: (v: number | null) => string }) {
+function MetricCell({ value, threshold, format }: {
+  value: number | null;
+  threshold: number;
+  format: (v: number | null) => string;
+}) {
   const status = metricStatus(value, threshold);
   return (
-    <span
-      className={
-        status === "breach"
-          ? "text-red-400 font-medium"
-          : status === "ok"
-            ? "text-green-400"
-            : "text-muted-foreground"
-      }
-    >
+    <span className={
+      status === "breach" ? "text-red-400 font-medium"
+        : status === "ok" ? "text-green-400"
+          : "text-muted-foreground"
+    }>
       {format(value)}
     </span>
   );
 }
 
-function ScanStatusBadge({ status }: { status: PerfScan["status"] }) {
-  if (status === "completed")
-    return <Badge variant="outline" className="bg-green-600/15 text-green-400 border-green-600/30"><CheckCircle2 className="h-3 w-3 mr-1" />Completed</Badge>;
-  if (status === "failed")
-    return <Badge variant="outline" className="bg-red-600/15 text-red-400 border-red-600/30"><XCircle className="h-3 w-3 mr-1" />Failed</Badge>;
-  return <Badge variant="outline" className="bg-blue-500/15 text-blue-400 border-blue-500/30"><Loader2 className="h-3 w-3 mr-1 animate-spin" />Running</Badge>;
+function PageStatusBadge({ page }: { page: PerfScanPage }) {
+  if (page.status === "running")
+    return (
+      <Badge variant="outline" className="bg-blue-500/15 text-blue-400 border-blue-500/30 whitespace-nowrap">
+        <Loader2 className="h-3 w-3 mr-1 animate-spin" />Scanning…
+      </Badge>
+    );
+  if (page.status === "failed")
+    return (
+      <Badge variant="outline" className="bg-red-600/15 text-red-400 border-red-600/30 whitespace-nowrap">
+        <XCircle className="h-3 w-3 mr-1" />Failed
+      </Badge>
+    );
+  const breaches = page.findingCount > 0;
+  return (
+    <Badge
+      variant="outline"
+      className={breaches
+        ? "bg-orange-500/15 text-orange-400 border-orange-500/30 whitespace-nowrap"
+        : "bg-green-600/15 text-green-400 border-green-600/30 whitespace-nowrap"}
+    >
+      {breaches
+        ? <><AlertTriangle className="h-3 w-3 mr-1" />{page.findingCount} breach{page.findingCount !== 1 ? "es" : ""}</>
+        : <><CheckCircle2 className="h-3 w-3 mr-1" />Pass</>}
+    </Badge>
+  );
 }
-
 function ScanSourceBadge({ source }: { source: "manual" | "scheduled" | undefined }) {
   if (source === "scheduled")
     return (
@@ -123,68 +137,72 @@ function ScanSourceBadge({ source }: { source: "manual" | "scheduled" | undefine
 
 interface Props {
   assessmentId: string;
+
   applicationId: string;
-  /** perfSlaConfig from the application row (may be null → use defaults). */
+
   applicationSlaConfig?: SlaConfig | null;
   /** Current automated scan cadence from the assessment row. */
+
   scanSchedule: ScanSchedule;
+
   canWrite: boolean;
+
+  applicationExtraUrls?: string[];
 }
 
 export default function PerformanceScanPanel({
   assessmentId,
   applicationId,
   applicationSlaConfig,
+  applicationExtraUrls = [],
   scanSchedule: initialScanSchedule,
   canWrite,
 }: Props) {
   const { toast } = useToast();
   const queryClient = useQueryClient();
+
+  // ── SLA dialog state
   const [slaDialogOpen, setSlaDialogOpen] = useState(false);
   const [slaForm, setSlaForm] = useState<SlaConfig>(applicationSlaConfig ?? DEFAULT_SLA);
 
+  // ── URL management dialog state
+  const [urlDialogOpen, setUrlDialogOpen] = useState(false);
+  const [urlList, setUrlList] = useState<string[]>(applicationExtraUrls);
+  const [newUrl, setNewUrl] = useState("");
+  const [newUrlError, setNewUrlError] = useState("");
+
   const activeSla: SlaConfig = applicationSlaConfig ?? DEFAULT_SLA;
 
-  // Poll scan history (re-fetches every 5s if any scan is running)
+  // ── Queries ───────────────────────────────────────────────────────────────
+
+  // Poll scan history; re-fetch every 5 s while any scan/page is running.
   const { data: scans = [], isLoading } = useQuery<PerfScan[]>({
     queryKey: [`/api/observatory/assessments/${assessmentId}/performance-scans`],
     refetchInterval: (data) => {
       if (!Array.isArray(data)) return false;
-      const hasRunning = (data as PerfScan[]).some((s) => s.status === "running");
+      const hasRunning = (data as PerfScan[]).some(
+        (s) => s.status === "running" || s.pages.some((p) => p.status === "running"),
+      );
       return hasRunning ? 5000 : false;
     },
   });
 
-  // Poll job queue status — backs off and stops at terminal states.
-  const { data: jobStatus } = useQuery<{ status: "active" | "pending" | "not_found" | "failed"; errorMessage?: string }>({
+  // Poll job queue status.
+  const { data: jobStatus } = useQuery<{ status: "active" | "pending" | "not_found" }>({
     queryKey: [`/api/observatory/assessments/${assessmentId}/performance-scan/status`],
-    refetchInterval: (query) => {
-      const s = (query.state.data as { status: string } | undefined)?.status;
-      if (s === "failed" || s === "not_found") return false; // terminal — stop polling
-      if (s === "active" || s === "pending") return 3000;
-      return 5000; // default while status unknown
-    },
+    refetchInterval: 5000,
   });
 
-  const isScanRunning = (jobStatus?.status === "active" || jobStatus?.status === "pending")
-    || scans.some((s) => s.status === "running");
-
-  const scanFailed = jobStatus?.status === "failed";
+  const isScanRunning =
+    jobStatus?.status === "active" ||
+    jobStatus?.status === "pending" ||
+    scans.some((s) => s.status === "running" || s.pages.some((p) => p.status === "running"));
 
   const invalidate = () => {
     queryClient.invalidateQueries({ predicate: (q) => String(q.queryKey[0]).startsWith("/api/observatory") });
   };
 
-  // Trigger scan
-  const triggerScan = useMutation({
-    mutationFn: async () => (await apiRequest("POST", `/api/observatory/assessments/${assessmentId}/performance-scan`)).json(),
-    onSuccess: (data) => {
-      invalidate();
-      toast({ title: "Performance scan started", description: `Scanning ${data.scanUrl}…` });
-    },
-    onError: (err: Error) => toast({ title: "Scan failed to start", description: err.message, variant: "destructive" }),
-  });
-
+  // ── Mutations ─────────────────────────────────────────────────────────────
   // Set scan schedule
   const setSchedule = useMutation({
     mutationFn: async (scanSchedule: ScanSchedule) =>
@@ -202,58 +220,97 @@ export default function PerformanceScanPanel({
     onError: (err: Error) => toast({ title: "Failed to update schedule", description: err.message, variant: "destructive" }),
   });
 
-  // Save SLA config
+
+  const triggerScan = useMutation({
+    mutationFn: async () =>
+      (await apiRequest("POST", `/api/observatory/assessments/${assessmentId}/performance-scan`)).json(),
+    onSuccess: (data) => {
+      invalidate();
+      const label = data.urlCount > 1 ? `${data.urlCount} pages` : data.scanUrl;
+      toast({ title: "Performance scan started", description: `Scanning ${label}…` });
+    },
+    onError: (err: Error) =>
+      toast({ title: "Scan failed to start", description: err.message, variant: "destructive" }),
+  });
+
   const saveSla = useMutation({
-    mutationFn: async () => (await apiRequest("PUT", `/api/observatory/applications/${applicationId}/perf-sla`, slaForm)).json(),
+    mutationFn: async () =>
+      (await apiRequest("PUT", `/api/observatory/applications/${applicationId}/perf-sla`, slaForm)).json(),
     onSuccess: () => {
       invalidate();
       setSlaDialogOpen(false);
       toast({ title: "SLA thresholds saved" });
     },
-    onError: (err: Error) => toast({ title: "Save failed", description: err.message, variant: "destructive" }),
+    onError: (err: Error) =>
+      toast({ title: "Save failed", description: err.message, variant: "destructive" }),
   });
 
-  // Show a destructive toast once when the scan transitions to failed.
-  const prevJobStatusRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    if (jobStatus?.status === "failed" && prevJobStatusRef.current !== "failed") {
-      toast({
-        title: "Performance scan failed",
-        description: jobStatus.errorMessage ?? "The scan encountered an error. Please try again.",
-        variant: "destructive",
-      });
-    }
-    prevJobStatusRef.current = jobStatus?.status;
-  }, [jobStatus?.status, jobStatus?.errorMessage, toast]);
+  const saveUrls = useMutation({
+    mutationFn: async (extraUrls: string[]) =>
+      (await apiRequest("PUT", `/api/observatory/applications/${applicationId}/perf-urls`, { extraUrls })).json(),
+    onSuccess: () => {
+      invalidate();
+      setUrlDialogOpen(false);
+      toast({ title: "Monitored URLs saved" });
+    },
+    onError: (err: Error) =>
+      toast({ title: "Save failed", description: err.message, variant: "destructive" }),
+  });
 
-  const latestCompleted = scans.find((s) => s.status === "completed");
+  // ── URL dialog helpers ────────────────────────────────────────────────────
+
+  const handleAddUrl = () => {
+    const trimmed = newUrl.trim();
+    if (!trimmed) return;
+    if (!isValidHttpUrl(trimmed)) {
+      setNewUrlError("Must be a valid http:// or https:// URL");
+      return;
+    }
+    if (urlList.includes(trimmed)) {
+      setNewUrlError("URL is already in the list");
+      return;
+    }
+    if (urlList.length >= 20) {
+      setNewUrlError("Maximum 20 extra URLs allowed");
+      return;
+    }
+    setUrlList([...urlList, trimmed]);
+    setNewUrl("");
+    setNewUrlError("");
+  };
+
+  const handleRemoveUrl = (idx: number) => {
+    setUrlList(urlList.filter((_, i) => i !== idx));
+  };
+
+  const openUrlDialog = () => {
+    setUrlList(applicationExtraUrls);
+    setNewUrl("");
+    setNewUrlError("");
+    setUrlDialogOpen(true);
+  };
+
+  // ── Derived data ──────────────────────────────────────────────────────────
+
+  // Flatten all page rows across all batches for the history table,
+  // newest batch first, pages within a batch in creation order.
+  // Include the parent scan's scanSource so the Source column can show Manual/Auto.
+  const allPageRows: (PerfScanPage & { batchId: string; batchDate: string; scanSource: "manual" | "scheduled" })[] = [];
+  for (const scan of scans) {
+    for (const page of scan.pages) {
+      allPageRows.push({ ...page, batchId: scan.id, batchDate: scan.createdAt, scanSource: scan.scanSource });
+    }
+  }
+
+  // Latest completed page for primary URL (for the summary card).
+  const latestPrimaryPage = allPageRows.find(
+    (p) => p.status === "completed",
+  );
+
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <div className="space-y-4">
-      {/* Scan failure banner — shown when the job queue reports a terminal failure */}
-      {scanFailed && (
-        <div className="flex items-start gap-3 rounded-md border border-red-600/40 bg-red-600/10 px-4 py-3 text-sm text-red-300">
-          <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-red-400" />
-          <div className="flex-1 min-w-0">
-            <p className="font-medium text-red-300">Performance scan failed</p>
-            <p className="text-xs text-red-400/80 mt-0.5 break-words">
-              {jobStatus?.errorMessage ?? "The scan encountered an error. Please try again."}
-            </p>
-          </div>
-          {canWrite && (
-            <Button
-              size="sm"
-              variant="destructive"
-              className="shrink-0 h-7 text-xs"
-              onClick={() => triggerScan.mutate()}
-              disabled={triggerScan.isPending}
-            >
-              Re-scan
-            </Button>
-          )}
-        </div>
-      )}
-
       {/* Header toolbar */}
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <div>
@@ -289,7 +346,14 @@ export default function PerformanceScanPanel({
               {SCHEDULE_LABELS[initialScanSchedule]}
             </span>
           )}
-
+          {canWrite && (
+            <Button variant="outline" size="sm" onClick={openUrlDialog} data-testid="button-open-url-config">
+              <Globe className="h-4 w-4 mr-1" /> Pages
+              {applicationExtraUrls.length > 0 && (
+                <span className="ml-1 text-xs bg-muted rounded px-1">{applicationExtraUrls.length + 1}</span>
+              )}
+            </Button>
+          )}
           {canWrite && (
             <Button variant="outline" size="sm" onClick={() => { setSlaForm(activeSla); setSlaDialogOpen(true); }} data-testid="button-open-sla-config">
               <Settings className="h-4 w-4 mr-1" /> SLA Thresholds
@@ -303,9 +367,9 @@ export default function PerformanceScanPanel({
               data-testid="button-trigger-perf-scan"
             >
               {isScanRunning ? (
-                <><Loader2 className="h-4 w-4 mr-1 animate-spin" /> Scanning…</>
+                <><Loader2 className="h-4 w-4 mr-1 animate-spin" />Scanning…</>
               ) : (
-                <><Play className="h-4 w-4 mr-1" /> Run Scan</>
+                <><Play className="h-4 w-4 mr-1" />Run Scan</>
               )}
             </Button>
           )}
@@ -336,29 +400,45 @@ export default function PerformanceScanPanel({
             <Clock className="h-3 w-3" /><span className="font-medium">{label}</span> ≤ {value}
           </span>
         ))}
+        {applicationExtraUrls.length > 0 && (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-muted text-muted-foreground border border-border">
+            <Globe className="h-3 w-3" />
+            <span className="font-medium">{applicationExtraUrls.length + 1} pages</span> per scan
+          </span>
+        )}
       </div>
 
-      {/* Latest metrics summary */}
-      {latestCompleted && (
+      {/* Latest completed page summary */}
+      {latestPrimaryPage && (
         <Card className="border-border">
           <CardHeader className="pb-2 pt-4 px-4">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
-              Latest Result — {formatDate(latestCompleted.scannedAt ?? latestCompleted.createdAt)}
-              <ScanSourceBadge source={latestCompleted.scanSource} />
+              Latest Result — {formatDate(latestPrimaryPage.scannedAt ?? latestPrimaryPage.createdAt)}
+              <span className="text-xs text-muted-foreground font-normal truncate max-w-[180px]" title={latestPrimaryPage.scanUrl}>
+                {urlPathname(latestPrimaryPage.scanUrl)}
+              </span>
             </CardTitle>
           </CardHeader>
           <CardContent className="px-4 pb-4">
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-sm">
               {[
-                { label: "TTFB", value: latestCompleted.ttfbMs, threshold: activeSla.ttfbMs, fmt: fmtMs },
-                { label: "Load Time", value: latestCompleted.loadTimeMs, threshold: activeSla.loadTimeMs, fmt: fmtMs },
-                { label: "LCP", value: latestCompleted.lcpMs, threshold: activeSla.lcpMs, fmt: fmtMs },
-                { label: "CLS", value: latestCompleted.clsScore !== null ? latestCompleted.clsScore * 10000 : null, threshold: activeSla.clsScore * 10000, fmt: (v: number | null) => v === null ? "—" : (v / 10000).toFixed(4) },
-                { label: "TTI", value: latestCompleted.ttiMs, threshold: activeSla.ttiMs, fmt: fmtMs },
+                { label: "TTFB", value: latestPrimaryPage.ttfbMs, threshold: activeSla.ttfbMs, fmt: fmtMs },
+                { label: "Load", value: latestPrimaryPage.loadTimeMs, threshold: activeSla.loadTimeMs, fmt: fmtMs },
+                { label: "LCP", value: latestPrimaryPage.lcpMs, threshold: activeSla.lcpMs, fmt: fmtMs },
+                {
+                  label: "CLS",
+                  value: latestPrimaryPage.clsScore !== null ? latestPrimaryPage.clsScore * 10000 : null,
+                  threshold: activeSla.clsScore * 10000,
+                  fmt: (v: number | null) => v === null ? "—" : (v / 10000).toFixed(4),
+                },
+                { label: "TTI", value: latestPrimaryPage.ttiMs, threshold: activeSla.ttiMs, fmt: fmtMs },
               ].map(({ label, value, threshold, fmt }) => {
                 const status = metricStatus(value, threshold);
                 return (
-                  <div key={label} className={`rounded-md border p-3 text-center ${status === "breach" ? "border-red-600/40 bg-red-600/5" : status === "ok" ? "border-green-600/30 bg-green-600/5" : "border-border"}`}>
+                  <div
+                    key={label}
+                    className={`rounded-md border p-3 text-center ${status === "breach" ? "border-red-600/40 bg-red-600/5" : status === "ok" ? "border-green-600/30 bg-green-600/5" : "border-border"}`}
+                  >
                     <p className="text-xs text-muted-foreground">{label}</p>
                     <p className={`text-base font-semibold mt-1 ${status === "breach" ? "text-red-400" : status === "ok" ? "text-green-400" : "text-foreground"}`}>
                       {fmt(value as any)}
@@ -368,88 +448,98 @@ export default function PerformanceScanPanel({
                 );
               })}
             </div>
-            {latestCompleted.findingCount > 0 && (
+            {latestPrimaryPage.findingCount > 0 && (
               <div className="flex items-center gap-1.5 mt-3 text-xs text-orange-400">
                 <AlertTriangle className="h-3.5 w-3.5" />
-                {latestCompleted.findingCount} SLA breach finding{latestCompleted.findingCount !== 1 ? "s" : ""} created — see Findings tab
+                {latestPrimaryPage.findingCount} SLA breach finding{latestPrimaryPage.findingCount !== 1 ? "s" : ""} created — see Findings tab
               </div>
             )}
-            {latestCompleted.warnings && latestCompleted.warnings.length > 0 && (
+            {latestPrimaryPage.warnings?.length > 0 && (
               <div className="mt-2 text-xs text-muted-foreground">
-                ⚠ {latestCompleted.warnings.join("; ")}
+                ⚠ {latestPrimaryPage.warnings.join("; ")}
               </div>
             )}
           </CardContent>
         </Card>
       )}
 
-      {/* Scan history table */}
+      {/* Scan history table — one row per URL per batch */}
       <div>
-        <p className="text-xs text-muted-foreground mb-2">Scan history (last 50)</p>
+        <p className="text-xs text-muted-foreground mb-2">
+          Scan history — one row per page per scan run (last 50 batches)
+        </p>
         {isLoading ? (
           <div className="flex items-center gap-2 text-sm text-muted-foreground py-4">
             <Loader2 className="h-4 w-4 animate-spin" /> Loading scan history…
           </div>
-        ) : scans.length === 0 ? (
-          <p className="text-sm text-muted-foreground py-4">No scans run yet. Click <strong>Run Scan</strong> to start.</p>
+        ) : allPageRows.length === 0 ? (
+          <p className="text-sm text-muted-foreground py-4">
+            No scans run yet. Click <strong>Run Scan</strong> to start.
+          </p>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border text-xs text-muted-foreground">
                   <th className="text-left py-2 pr-3 font-normal">Date</th>
+                  <th className="text-left py-2 pr-3 font-normal">Page</th>
                   <th className="text-left py-2 pr-3 font-normal">Source</th>
                   <th className="text-right py-2 pr-3 font-normal">TTFB</th>
                   <th className="text-right py-2 pr-3 font-normal">Load</th>
                   <th className="text-right py-2 pr-3 font-normal">LCP</th>
                   <th className="text-right py-2 pr-3 font-normal">CLS</th>
                   <th className="text-right py-2 pr-3 font-normal">TTI</th>
-                  <th className="text-right py-2 pr-3 font-normal">Findings</th>
-                  <th className="text-right py-2 font-normal">Status</th>
+                  <th className="text-right py-2 font-normal">Result</th>
                 </tr>
               </thead>
               <tbody>
-                {scans.map((scan) => (
-                  <tr key={scan.id} className="border-b border-border/50 hover:bg-muted/30 transition-colors" data-testid={`row-perf-scan-${scan.id}`}>
-                    <td className="py-2 pr-3 text-muted-foreground whitespace-nowrap">
-                      {formatDate(scan.scannedAt ?? scan.createdAt)}
+                {allPageRows.map((page) => (
+                  <tr
+                    key={page.id}
+                    className="border-b border-border/50 hover:bg-muted/30 transition-colors"
+                    data-testid={`row-perf-page-${page.id}`}
+                  >
+                    <td className="py-2 pr-3 text-muted-foreground whitespace-nowrap text-xs">
+                      {formatDate(page.scannedAt ?? page.createdAt)}
+                    </td>
+                    <td className="py-2 pr-3 max-w-[160px]">
+                      <span
+                        className="inline-flex items-center gap-1 text-xs text-muted-foreground truncate"
+                        title={page.scanUrl}
+                      >
+                        <Link2 className="h-3 w-3 shrink-0 text-muted-foreground/50" />
+                        <span className="truncate">{urlPathname(page.scanUrl)}</span>
+                      </span>
                     </td>
                     <td className="py-2 pr-3">
-                      <ScanSourceBadge source={scan.scanSource} />
+                      <ScanSourceBadge source={page.scanSource} />
                     </td>
                     <td className="py-2 pr-3 text-right">
-                      <MetricCell value={scan.ttfbMs} threshold={activeSla.ttfbMs} format={fmtMs} />
+                      <MetricCell value={page.ttfbMs} threshold={activeSla.ttfbMs} format={fmtMs} />
                     </td>
                     <td className="py-2 pr-3 text-right">
-                      <MetricCell value={scan.loadTimeMs} threshold={activeSla.loadTimeMs} format={fmtMs} />
+                      <MetricCell value={page.loadTimeMs} threshold={activeSla.loadTimeMs} format={fmtMs} />
                     </td>
                     <td className="py-2 pr-3 text-right">
-                      <MetricCell value={scan.lcpMs} threshold={activeSla.lcpMs} format={fmtMs} />
+                      <MetricCell value={page.lcpMs} threshold={activeSla.lcpMs} format={fmtMs} />
                     </td>
                     <td className="py-2 pr-3 text-right">
                       <MetricCell
-                        value={scan.clsScore}
+                        value={page.clsScore}
                         threshold={activeSla.clsScore}
                         format={(v) => v === null ? "—" : v.toFixed(4)}
                       />
                     </td>
                     <td className="py-2 pr-3 text-right">
-                      <MetricCell value={scan.ttiMs} threshold={activeSla.ttiMs} format={fmtMs} />
-                    </td>
-                    <td className="py-2 pr-3 text-right">
-                      {scan.findingCount > 0 ? (
-                        <span className="text-orange-400">{scan.findingCount}</span>
-                      ) : scan.status === "completed" ? (
-                        <span className="text-green-400">0</span>
-                      ) : (
-                        <span className="text-muted-foreground">—</span>
-                      )}
+                      <MetricCell value={page.ttiMs} threshold={activeSla.ttiMs} format={fmtMs} />
                     </td>
                     <td className="py-2 text-right">
-                      {scan.status === "failed" && scan.scanError ? (
-                        <span title={scan.scanError}><ScanStatusBadge status={scan.status} /></span>
+                      {page.status === "failed" && page.scanError ? (
+                        <span title={page.scanError}>
+                          <PageStatusBadge page={page} />
+                        </span>
                       ) : (
-                        <ScanStatusBadge status={scan.status} />
+                        <PageStatusBadge page={page} />
                       )}
                     </td>
                   </tr>
@@ -460,7 +550,82 @@ export default function PerformanceScanPanel({
         )}
       </div>
 
-      {/* SLA configuration dialog */}
+      {/* ── URL management dialog ──────────────────────────────────────────── */}
+      <Dialog open={urlDialogOpen} onOpenChange={setUrlDialogOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Monitored Pages</DialogTitle>
+            <DialogDescription>
+              Add extra pages to include in every performance scan. The primary application URL is always scanned;
+              add inner pages here to catch slow routes that the homepage wouldn't reveal.
+              Maximum 20 additional URLs.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            {/* Existing URL list */}
+            {urlList.length === 0 ? (
+              <p className="text-xs text-muted-foreground">No extra pages configured. Only the primary app URL will be scanned.</p>
+            ) : (
+              <ul className="space-y-1.5">
+                {urlList.map((u, i) => (
+                  <li key={i} className="flex items-center gap-2 text-sm rounded border border-border bg-muted/40 px-3 py-1.5">
+                    <Link2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                    <span className="flex-1 truncate text-xs" title={u}>{u}</span>
+                    {canWrite && (
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveUrl(i)}
+                        className="text-muted-foreground hover:text-red-400 transition-colors shrink-0"
+                        aria-label={`Remove ${u}`}
+                        data-testid={`button-remove-url-${i}`}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            {/* Add new URL */}
+            {canWrite && urlList.length < 20 && (
+              <div className="space-y-1">
+                <Label className="text-xs">Add a page URL</Label>
+                <div className="flex gap-2">
+                  <Input
+                    type="url"
+                    placeholder="https://example.com/pricing"
+                    value={newUrl}
+                    onChange={(e) => { setNewUrl(e.target.value); setNewUrlError(""); }}
+                    onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleAddUrl(); } }}
+                    className="text-sm"
+                    data-testid="input-new-perf-url"
+                  />
+                  <Button type="button" size="sm" variant="outline" onClick={handleAddUrl} data-testid="button-add-url">
+                    <Plus className="h-4 w-4" />
+                  </Button>
+                </div>
+                {newUrlError && <p className="text-xs text-red-400">{newUrlError}</p>}
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setUrlDialogOpen(false)}>Cancel</Button>
+            <Button
+              onClick={() => saveUrls.mutate(urlList)}
+              disabled={saveUrls.isPending}
+              data-testid="button-save-urls"
+            >
+              {saveUrls.isPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── SLA configuration dialog ───────────────────────────────────────── */}
       <Dialog open={slaDialogOpen} onOpenChange={setSlaDialogOpen}>
         <DialogContent className="max-w-sm">
           <DialogHeader>
@@ -511,4 +676,38 @@ export default function PerformanceScanPanel({
       </Dialog>
     </div>
   );
+}
+
+interface PerfScanPage {
+  id: string;
+  scanUrl: string;
+  status: "running" | "completed" | "failed";
+  ttfbMs: number | null;
+  loadTimeMs: number | null;
+  lcpMs: number | null;
+  clsScore: number | null;
+  ttiMs: number | null;
+  findingCount: number;
+  scanError: string | null;
+  warnings: string[];
+  scannedAt: string | null;
+  createdAt: string;
+}
+
+function urlPathname(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.pathname || "/";
+  } catch {
+    return url;
+  }
+}
+
+function isValidHttpUrl(s: string): boolean {
+  try {
+    const u = new URL(s);
+    return u.protocol === "https:" || u.protocol === "http:";
+  } catch {
+    return false;
+  }
 }

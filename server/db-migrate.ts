@@ -63,6 +63,39 @@ function extractCreatedTableNames(sql: string): string[] {
   return [...new Set(names)];
 }
 
+/**
+ * Parse a migration file's SQL for ADD COLUMN statements.
+ * Returns `{ table, column }` pairs so the backfill probe can verify the
+ * columns actually exist instead of blindly stamping alter-only files.
+ *
+ * Handles both bare DDL and DO $$ BEGIN … EXCEPTION … END $$ wrappers.
+ */
+function extractAddedColumns(sql: string): Array<{ table: string; column: string }> {
+  // ALTER TABLE tbl ADD COLUMN [IF NOT EXISTS] col  (column name is the next bare word)
+  const re =
+    /ALTER\s+TABLE\s+"?([a-z_][a-z0-9_]*)"?\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?"?([a-z_][a-z0-9_]*)"?/gi;
+  const pairs: Array<{ table: string; column: string }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sql)) !== null) {
+    pairs.push({ table: m[1].toLowerCase(), column: m[2].toLowerCase() });
+  }
+  return pairs;
+}
+
+/** Check whether a given column exists in the public schema. */
+async function columnExists(
+  pool: pg.Pool,
+  tableName: string,
+  columnName: string
+): Promise<boolean> {
+  const r = await pool.query(
+    `SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2 LIMIT 1`,
+    [tableName, columnName]
+  );
+  return r.rows.length > 0;
+}
+
 /** Check whether a given table exists in the public schema. */
 async function tableExists(pool: pg.Pool, tableName: string): Promise<boolean> {
   const r = await pool.query(
@@ -116,10 +149,36 @@ async function computeBackfillPlan(
     const tableNames = extractCreatedTableNames(content);
 
     if (tableNames.length === 0) {
-      // File only has ALTER TABLE / CREATE INDEX / DO blocks — no new tables.
-      // Assume present: if we're here, users exists so the DB is established.
-      console.log(`${label} backfill: stamping (no CREATE TABLE, alter-only): ${filename}`);
-      toStamp.push(filePath);
+      // File has no CREATE TABLE — it may only contain ALTER TABLE ADD COLUMN,
+      // CREATE INDEX, or DO blocks. Probe the specific columns it adds; if any
+      // are missing the file must be applied for real, not silently stamped.
+      const addedCols = extractAddedColumns(content);
+      if (addedCols.length === 0) {
+        // Only indexes / constraints / DO blocks with no detectable schema change.
+        // Safe to stamp: idempotent DDL (IF NOT EXISTS) won't break on re-run
+        // and we have no column handle to probe.
+        console.log(`${label} backfill: stamping (index/constraint only, no column probe): ${filename}`);
+        toStamp.push(filePath);
+        continue;
+      }
+
+      // Probe every column the migration adds. Stamp only if ALL are present.
+      let allColsPresent = true;
+      for (const { table, column } of addedCols) {
+        const present = await columnExists(pool, table, column);
+        if (!present) {
+          console.log(`${label} backfill: column '${table}.${column}' missing — will apply: ${filename}`);
+          allColsPresent = false;
+          break;
+        }
+      }
+
+      if (allColsPresent) {
+        console.log(`${label} backfill: stamping (all ADD COLUMN columns present): ${filename}`);
+        toStamp.push(filePath);
+      } else {
+        toApply.push(filePath);
+      }
       continue;
     }
 
