@@ -13,7 +13,7 @@ import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useUser } from "@/lib/userContext";
 import { Link, useParams } from "wouter";
-import { ArrowLeft, CheckCircle2, Loader2, NotebookPen, Paperclip, Plus, ScanLine, Sparkles, Wand2, X } from "lucide-react";
+import { ArrowLeft, CheckCircle2, Loader2, NotebookPen, Paperclip, Plus, RefreshCw, ScanLine, Sparkles, Wand2, X } from "lucide-react";
 import {
   workbenchBySlug,
   REVIEW_STATUSES,
@@ -92,6 +92,8 @@ export default function ObservatoryReviewWorkbench() {
   const isAccessibility = wb?.moduleKey === "accessibility";
   const [scanPolling, setScanPolling] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Track open-finding count before scan starts so we can show a delta in the completion toast.
+  const preScanOpenCountRef = useRef<number>(0);
 
   const { data: scanStatus, refetch: refetchScanStatus } = useQuery<ScanJobStatus>({
     queryKey: [`/api/observatory/assessments/${assessmentId}/scan-status`],
@@ -106,8 +108,25 @@ export default function ObservatoryReviewWorkbench() {
     const curr = scanStatus?.status;
     if ((prev === "active" || prev === "pending") && curr === "not_found") {
       setScanPolling(false);
-      invalidate();
-      toast({ title: "Scan complete", description: "Accessibility findings have been added to the workbench." });
+      // Invalidate so we get fresh finding statuses for the delta toast.
+      queryClient.invalidateQueries({ predicate: (q) => String(q.queryKey[0]).startsWith("/api/observatory") });
+      // Read the refreshed items from cache after invalidation settles.
+      setTimeout(() => {
+        const freshItems: ReviewItem[] | undefined = queryClient.getQueryData([
+          `/api/observatory/assessments/${assessmentId}/review-items`,
+        ]);
+        const openAfter = (freshItems ?? [])
+          .flatMap((i) => i.findings)
+          .filter((f) => f.status === "open").length;
+        const preScanOpen = preScanOpenCountRef.current;
+        const resolved = Math.max(0, preScanOpen - openAfter);
+        const newFindings = Math.max(0, openAfter - preScanOpen + resolved);
+        const parts: string[] = [];
+        if (resolved > 0) parts.push(`${resolved} finding${resolved === 1 ? "" : "s"} auto-resolved`);
+        if (newFindings > 0) parts.push(`${newFindings} new finding${newFindings === 1 ? "" : "s"} detected`);
+        if (parts.length === 0) parts.push("No changes to open findings");
+        toast({ title: "Re-scan complete", description: parts.join(" · ") + "." });
+      }, 800);
     }
     prevScanStatusRef.current = curr;
   }, [scanStatus?.status]);
@@ -270,12 +289,24 @@ export default function ObservatoryReviewWorkbench() {
   const azureItems = (items ?? []).filter((i) => i.module === "architecture_azure");
   const initialized = primaryItems.length > 0;
 
+  // Whether any scan-linked findings already exist — drives "Re-scan" vs "Run scan" UX.
+  const hasExistingFindings = primaryItems.some((i) => i.findings.length > 0);
+
   const openNotes = (item: ReviewItem) => {
     setNotesForm({ notes: item.notes ?? "", reviewer: item.reviewer ?? "" });
     setNotesItem(item);
   };
 
-  const completed = primaryItems.filter((i) => i.status !== "Not Tested").length;
+  // A category counts as reviewed when either:
+  //   (a) the analyst has manually set a status (not "Not Tested"), OR
+  //   (b) all linked scan findings have been resolved/remediated (none open).
+  // This ensures the counter reflects re-scan auto-remediation without touching
+  // review-item statuses in the database.
+  const completed = primaryItems.filter(
+    (i) =>
+      i.status !== "Not Tested" ||
+      (i.findings.length > 0 && i.findings.every((f) => f.status !== "open")),
+  ).length;
 
   function renderChecklist(rows: ReviewItem[], statuses: readonly string[], sectionTestId: string) {
     return (
@@ -397,16 +428,30 @@ export default function ObservatoryReviewWorkbench() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => triggerScanMutation.mutate()}
+                onClick={() => {
+                  // Capture the current open-finding count before the scan starts
+                  // so we can compute the resolved/new delta in the completion toast.
+                  preScanOpenCountRef.current = primaryItems
+                    .flatMap((i) => i.findings)
+                    .filter((f) => f.status === "open").length;
+                  triggerScanMutation.mutate();
+                }}
                 disabled={
                   triggerScanMutation.isPending ||
                   scanStatus?.status === "active" ||
                   scanStatus?.status === "pending"
                 }
                 data-testid="button-run-a11y-scan"
+                title={
+                  hasExistingFindings
+                    ? "Re-run the accessibility scan. Findings no longer detected will be automatically marked resolved."
+                    : "Run an automated WCAG 2.1/2.2 accessibility scan with axe-core"
+                }
               >
                 {(triggerScanMutation.isPending || scanStatus?.status === "active" || scanStatus?.status === "pending") ? (
                   <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Scanning…</>
+                ) : hasExistingFindings ? (
+                  <><RefreshCw className="h-4 w-4 mr-2" /> Re-scan</>
                 ) : (
                   <><ScanLine className="h-4 w-4 mr-2" /> Run accessibility scan</>
                 )}
@@ -427,11 +472,13 @@ export default function ObservatoryReviewWorkbench() {
               <Loader2 className="h-4 w-4 animate-spin text-blue-500 shrink-0" />
               <div className="min-w-0">
                 <p className="text-sm font-medium">
-                  {scanStatus.status === "pending" ? "Scan queued" : "Accessibility scan running"}
+                  {scanStatus.status === "pending"
+                    ? hasExistingFindings ? "Re-scan queued" : "Scan queued"
+                    : hasExistingFindings ? "Re-scanning for accessibility issues" : "Accessibility scan running"}
                 </p>
                 <p className="text-xs text-muted-foreground">
                   {scanStatus.status === "active"
-                    ? `Running for ${scanStatus.runningSec ?? 0}s — WCAG 2.1/2.2 violations are being checked with axe-core`
+                    ? `Running for ${scanStatus.runningSec ?? 0}s — WCAG 2.1/2.2 violations checked with axe-core${hasExistingFindings ? "; findings no longer detected will be auto-resolved" : ""}`
                     : `Position ${scanStatus.queuePosition ?? "—"} in queue`}
                 </p>
               </div>

@@ -320,7 +320,12 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
   if (staleOpenIds.length > 0) {
     await db
       .update(obsFindings)
-      .set({ status: "remediated", resolvedAt: new Date(), updatedAt: new Date() })
+      .set({
+        status: "remediated",
+        resolvedAt: new Date(),
+        resolutionNote: "Resolved by re-scan — issue no longer detected by automated scanner",
+        updatedAt: new Date(),
+      })
       .where(inArray(obsFindings.id, staleOpenIds));
     findingsResolved = staleOpenIds.length;
   }
