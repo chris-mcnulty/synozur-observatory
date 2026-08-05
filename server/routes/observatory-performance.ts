@@ -20,7 +20,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { db } from "../db";
-import { and, desc, eq, gte } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull } from "drizzle-orm";
 import { getRequestContext, ContextError, type RequestContext } from "../context";
 import { hasContentAccess } from "./helpers";
 import {
@@ -38,12 +38,14 @@ import { enqueue, getJobStatusByLabel } from "../services/job-queue";
 import {
   runPerformanceScan,
   DEFAULT_PERF_SLA,
+  PERF_SLA_RULE_IDS,
   type PerfSlaConfig,
 } from "../services/performance-scanner";
 import { assertScanUrlSafe } from "../services/ssrf-guard";
 import { shouldSkipFinding } from "../services/perf-scan-schedule-core";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
 
 async function ctxOr401(req: Request, res: Response): Promise<RequestContext | null> {
   try {
@@ -378,6 +380,8 @@ export function registerObservatoryPerformanceRoutes(app: Express) {
       }
 
       // Create a "running" scan row immediately so the UI can show progress.
+      // scanSource: "manual" so the scheduler and trend queries can distinguish
+      // user-triggered scans from automated ones.
       const [scanRow] = await db
         .insert(obsPerformanceScans)
         .values({
@@ -400,25 +404,229 @@ export function registerObservatoryPerformanceRoutes(app: Express) {
         "other",
         jobLabel,
         async () => {
-          await executePerfScan({
-            tenantDomain: ctx.tenantDomain,
-            assessment: {
-              id: assessment.id,
-              applicationId: assessment.applicationId,
-              versionId: assessment.versionId,
-              title: assessment.title,
-            },
-            scanRow,
-            url: url.trim(),
-            slaConfig,
-            scanSource: "manual",
-            triggeredByUserId: ctx.userId,
-          });
+          try {
+            const { metrics, findings } = await runPerformanceScan(url.trim(), slaConfig, {
+              timeoutMs: 60_000,
+            });
+
+            // ── Reconcile findings ────────────────────────────────────────
+            // Fetch all findings for this assessment that were created by
+            // automated scans (scanRuleId IS NOT NULL). Manual findings and
+            // legacy rows without a scanRuleId are never touched.
+            const scanUrl = url.trim();
+            // Load only SLA findings for this specific URL.
+            //
+            // Two scopes are applied here deliberately:
+            //
+            // 1. Rule-ID namespace (inArray PERF_SLA_RULE_IDS): prevents the
+            //    general /scan provider-path findings (slow-ttfb etc.) from
+            //    being visible to this reconcile and vice-versa.
+            //
+            // 2. URL scope (eq affectedComponent, scanUrl): an assessment can
+            //    be scanned against multiple URLs over time. Without this
+            //    constraint, a clean scan of URL-B would mark URL-A's open
+            //    findings as stale and auto-resolve them — false remediations.
+            //    Scoping to the current scanUrl ensures staleOpenIds can only
+            //    ever contain findings that this specific scan run was
+            //    responsible for checking.
+            const existingFindings = await db
+              .select({
+                id: obsFindings.id,
+                scanRuleId: obsFindings.scanRuleId,
+                affectedComponent: obsFindings.affectedComponent,
+                status: obsFindings.status,
+              })
+              .from(obsFindings)
+              .where(
+                and(
+                  eq(obsFindings.assessmentId, assessment.id),
+                  eq(obsFindings.tenantDomain, ctx.tenantDomain),
+                  isNotNull(obsFindings.scanRuleId),
+                  inArray(obsFindings.scanRuleId, [...PERF_SLA_RULE_IDS]),
+                  eq(obsFindings.affectedComponent, scanUrl),
+                ),
+              );
+
+            // Match key: "ruleId|url" — unique per metric per scanned URL.
+            // "remediated" findings are intentionally excluded so that a
+            // re-breach after remediation creates a fresh "open" finding
+            // (preserving the remediation history rather than reopening the
+            // old row). Human-set statuses other than "remediated"
+            // (accepted_risk, false_positive, in_progress, verified) ARE
+            // included so we never insert a duplicate while those decisions
+            // are active.
+            const existingByRuleKey = new Map(
+              existingFindings
+                .filter((f) => f.status !== "remediated")
+                .map((f) => [`${f.scanRuleId}|${f.affectedComponent ?? ""}`, f]),
+            );
+            const matchedFindingIds = new Set<string>();
+
+            // Intra-scan dedup: buildPerfFindings() already guarantees at most
+            // one finding per ruleId, but guard defensively.
+            const seenScanKeys = new Set<string>();
+
+            let findingCount = 0;   // new findings inserted
+            let findingsSkipped = 0; // still-breaching, refreshed in place
+            let findingsResolved = 0; // auto-resolved (now within SLA)
+
+            for (const f of findings) {
+              const ruleKey = `${f.ruleId}|${scanUrl}`;
+              if (seenScanKeys.has(ruleKey)) {
+                findingsSkipped++;
+                continue;
+              }
+              seenScanKeys.add(ruleKey);
+
+              const existing = existingByRuleKey.get(ruleKey);
+
+              if (existing) {
+                // Already tracked — mark matched so it is not auto-resolved.
+                matchedFindingIds.add(existing.id);
+
+                if (existing.status === "open") {
+                  // Still breaching + still open → refresh metadata with the
+                  // latest measured values. Never override human-set statuses.
+                  try {
+                    await db
+                      .update(obsFindings)
+                      .set({
+                        title: f.title,
+                        description: f.description,
+                        severity: f.severity,
+                        recommendation: f.recommendation,
+                        updatedAt: new Date(),
+                      })
+                      .where(eq(obsFindings.id, existing.id));
+                  } catch (updateErr) {
+                    console.error("[perf-scan] Failed to refresh finding:", updateErr);
+                  }
+                }
+                // Human-set statuses (remediated, accepted_risk, false_positive,
+                // in_progress, verified) are left completely untouched.
+                findingsSkipped++;
+              } else {
+                // First time this rule has breached — insert a new finding.
+                try {
+                  const [created] = await db
+                    .insert(obsFindings)
+                    .values({
+                      tenantDomain: ctx.tenantDomain,
+                      assessmentId: assessment.id,
+                      applicationId: assessment.applicationId,
+                      versionId: assessment.versionId,
+                      title: f.title,
+                      description: f.description,
+                      severity: f.severity,
+                      domain: "performance",
+                      status: "open",
+                      recommendation: f.recommendation,
+                      affectedComponent: scanUrl,
+                      scanRuleId: f.ruleId,
+                    })
+                    .returning({ id: obsFindings.id });
+                  findingCount++;
+                  matchedFindingIds.add(created.id);
+
+                  // Audit log for each new finding.
+                  await db.insert(obsAuditLogs).values({
+                    tenantDomain: ctx.tenantDomain,
+                    userId: null,
+                    entityType: "finding",
+                    entityId: created.id,
+                    action: "create",
+                    summary: `Performance scan created finding: ${f.title} (${f.severity})`,
+                  }).catch(() => {});
+                } catch (findingErr) {
+                  console.error("[perf-scan] Failed to persist finding:", findingErr);
+                }
+              }
+            }
+
+            // ── Auto-resolve findings that are no longer breaching ────────
+            // Only open findings previously created by this scanner (scanRuleId
+            // set) that were NOT matched in this scan are candidates.
+            // Human-set statuses are excluded by the status === "open" filter.
+            // NOTE: later commits add per-URL and namespace scoping here.
+            const staleOpenIds = existingFindings
+              .filter((f) => f.status === "open" && !matchedFindingIds.has(f.id))
+              .map((f) => f.id);
+
+            if (staleOpenIds.length > 0) {
+              try {
+                await db
+                  .update(obsFindings)
+                  .set({ status: "remediated", resolvedAt: new Date(), updatedAt: new Date() })
+                  .where(inArray(obsFindings.id, staleOpenIds));
+                findingsResolved = staleOpenIds.length;
+
+                // One bulk audit entry for the auto-resolve batch.
+                await db.insert(obsAuditLogs).values({
+                  tenantDomain: ctx.tenantDomain,
+                  userId: null,
+                  entityType: "finding",
+                  entityId: assessment.id, // assessment as the anchor entity
+                  action: "bulk_update",
+                  summary: `Performance scan auto-resolved ${findingsResolved} finding(s) now within SLA (assessment ${assessment.id})`,
+                }).catch(() => {});
+              } catch (resolveErr) {
+                console.error("[perf-scan] Failed to auto-resolve findings:", resolveErr);
+              }
+            }
+
+            // Store raw metrics as scan_report evidence linked to the assessment.
+            try {
+              const evidenceBody = JSON.stringify({ metrics, findings, slaConfig }, null, 2);
+              const [ev] = await db
+                .insert(obsEvidence)
+                .values({
+                  tenantDomain: ctx.tenantDomain,
+                  title: `Performance Scan Report — ${new Date(metrics.scannedAt).toISOString().slice(0, 10)}`,
+                  description: `Headless browser performance scan of ${url}. ${findingCount} SLA breach(es) found.`,
+                  evidenceType: "scan_report",
+                  source: "headless-browser",
+                  collectedAt: new Date(metrics.scannedAt),
+                })
+                .returning({ id: obsEvidence.id });
+
+              await db
+                .insert(obsAssessmentEvidence)
+                .values({ assessmentId: assessment.id, evidenceId: ev.id })
+                .onConflictDoNothing();
+            } catch (evErr) {
+              console.error("[perf-scan] Failed to persist evidence:", evErr);
+            }
+
+            // Mark scan row completed with metrics.
+            await db
+              .update(obsPerformanceScans)
+              .set({
+                status: "completed",
+                ttfbMs: metrics.ttfbMs ?? null,
+                loadTimeMs: metrics.loadTimeMs ?? null,
+                lcpMs: metrics.lcpMs ?? null,
+                clsScore: metrics.clsScore ?? null,
+                ttiMs: metrics.ttiMs ?? null,
+                findingCount,
+                warnings: (metrics.warnings ?? []) as any,
+                scannedAt: new Date(metrics.scannedAt),
+              })
+              .where(eq(obsPerformanceScans.id, scanRow.id));
+
+            console.log(`[perf-scan] Completed scan for assessment ${assessment.id}: ${findingCount} created, ${findingsSkipped} refreshed, ${findingsResolved} auto-resolved`);
+          } catch (err: any) {
+            console.error(`[perf-scan] Scan failed for assessment ${assessment.id}:`, err);
+            await db
+              .update(obsPerformanceScans)
+              .set({ status: "failed", scanError: err?.message ?? String(err) })
+              .where(eq(obsPerformanceScans.id, scanRow.id))
+              .catch(() => {});
+          }
         },
         {
           priority: 3,
           timeoutMs: 120_000,
-          maxRetries: 0, // manual: user can click again
+          maxRetries: 0,
           ctx: { tenantDomain: ctx.tenantDomain, targetId: assessment.id, targetName: assessment.title },
         },
       );

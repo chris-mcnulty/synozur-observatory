@@ -12,3 +12,6 @@ Both scan paths (general `observatory-scan-runner.ts` and pen-test route) reconc
 
 **Why:** re-scans previously duplicated findings (dedup key mismatch: null affectedComponent) and re-opened human-remediated rows; manual findings must never be auto-closed.
 **How to apply:** any new scanner or scan-ingest path must follow this contract; findings it creates must set scanRuleId.
+
+## Reconcile scoping lesson
+Auto-resolve must be scoped to exactly what the current scan measured — both the rule-ID namespace the scan path owns AND the URL/target it just scanned. Anything broader falsely remediates findings from other scan paths or other pages. Assert namespace disjointness and cross-URL isolation in tests.

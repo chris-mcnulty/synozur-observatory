@@ -130,6 +130,11 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
   }
 
   async function executeScan(): Promise<ScanRunResult> {
+  // scanner is non-null here (null-checked before executeScan is ever invoked),
+  // but TypeScript cannot narrow a closed-over variable through a nested function
+  // boundary. Bind to a fresh const so all uses below are provably non-null.
+  const sc = scanner!;
+
   // ── 4. Run scan ───────────────────────────────────────────────────────────
   const request: ScanRequest = {
     tenantDomain,
@@ -140,8 +145,8 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
     options: opts.pageLimit != null ? { pageLimit: opts.pageLimit } : undefined,
   };
 
-  console.log(`[ScanRunner] Starting ${scanner.key} scan for assessment ${assessmentId} (${assessment.type}) → ${targetUrl}`);
-  const result = await scanner.runScan({ ...request, signal: opts.signal });
+  console.log(`[ScanRunner] Starting ${sc.key} scan for assessment ${assessmentId} (${assessment.type}) → ${targetUrl}`);
+  const result = await sc.runScan({ ...request, signal: opts.signal });
 
   // ── 5. Persist raw report as evidence (including full JSON body) ────────────
   let evidenceId: string | null = null;
@@ -150,7 +155,7 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
       .insert(obsEvidence)
       .values({
         tenantDomain,
-        title: `${scanner.name} scan report — ${new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}`,
+        title: `${sc.name} scan report — ${new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}`,
         description: `Automated scan by ${result.tool}. Duration: ${Math.round((result.finishedAt.getTime() - result.startedAt.getTime()) / 1000)}s.`,
         evidenceType: "scan_report",
         contentType: result.rawReport.contentType,
@@ -382,17 +387,28 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
 
   // ── 6b. Auto-resolve scan findings no longer detected ──────────────────────
   // Only rows this scanner previously created (scanRuleId set) AND still "open"
-  // are candidates. Two safety guards prevent false positives:
-  //   1. Global guard: if any page was unreachable, skip auto-resolve entirely.
-  //   2. Scope-change guard: if a finding's source_pages contains a URL that
-  //      wasn't in the current scan, leave it open — we can't know if it's fixed.
+  // are candidates. Three safety guards prevent false positives:
+  //
+  //   1. Global unreachable guard: if any finding was "target-unreachable",
+  //      skip auto-resolve entirely — a transient outage must not mass-close
+  //      real findings.
+  //
+  //   2. Namespace guard: when the scanner declares ownedRuleIds, only
+  //      auto-resolve findings whose scanRuleId is in that set. Prevents
+  //      cross-path interference when the same assessment type has multiple
+  //      scan entry points (e.g. /scan provider path vs /performance-scan
+  //      SLA route) each owning distinct rule-ID namespaces.
+  //
+  //   3. Scope-change guard: if a finding's source_pages contains a URL that
+  //      wasn't in the current scan's page set, leave it open — we can't know
+  //      if it's fixed on pages we didn't visit.
   const staleOpenIds = scanUnreachable ? [] : existingFindings
-    .filter((f) =>
-      f.scanRuleId != null &&
-      f.status === "open" &&
-      !matchedFindingIds.has(f.id) &&
-      allSourcePagesWereScanned(f.sourcePages, scannedPages),
-    )
+    .filter((f) => {
+      if (f.scanRuleId == null || f.status !== "open" || matchedFindingIds.has(f.id)) return false;
+      if (sc.ownedRuleIds && !sc.ownedRuleIds.includes(f.scanRuleId)) return false;
+      if (!allSourcePagesWereScanned(f.sourcePages, scannedPages)) return false;
+      return true;
+    })
     .map((f) => f.id);
 
   if (staleOpenIds.length > 0) {
@@ -416,7 +432,7 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
 
   const durationMs = Date.now() - started;
   console.log(
-    `[ScanRunner] Completed ${scanner.key} for ${assessmentId}: ` +
+    `[ScanRunner] Completed ${sc.key} for ${assessmentId}: ` +
     `${findingsCreated} findings created, ${findingsSkipped} updated/skipped, ${findingsResolved} auto-resolved, ${Math.round(durationMs / 1000)}s`,
   );
 

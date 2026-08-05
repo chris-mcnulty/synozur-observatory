@@ -85,6 +85,14 @@ export interface ScannerProvider {
   readonly name: string;
   /** Which assessment types this provider can serve, e.g. ["accessibility"]. */
   readonly assessmentTypes: string[];
+  /**
+   * Optional: the complete set of ruleIds this provider can ever produce.
+   * When set, the scan-runner's auto-resolve step is scoped to only findings
+   * in this namespace, preventing cross-path interference when the same
+   * assessment type has multiple entry points (e.g. the dedicated
+   * /performance-scan SLA route vs the general /scan provider path).
+   */
+  readonly ownedRuleIds?: readonly string[];
   /** Cheap availability probe (credentials present, endpoint reachable). */
   isAvailable(tenantDomain: string): Promise<boolean>;
   /** Execute one scan. Called from a job-queue handler, never inline. */

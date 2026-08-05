@@ -42,10 +42,40 @@ interface PerfTiming {
   resourceCount: number;
 }
 
+/**
+ * Rule IDs produced by the standalone /performance-scan route (buildPerfFindings).
+ * The dedicated route's reconcile must only auto-resolve findings in this namespace.
+ */
+export const PERF_SLA_RULE_IDS = [
+  "ttfb_sla_breach",
+  "load_time_sla_breach",
+  "lcp_sla_breach",
+  "cls_sla_breach",
+  "tti_sla_breach",
+] as const;
+
+/**
+ * Rule IDs produced by the ScannerProvider path (performanceScanner.runScan,
+ * called via the general /scan route through runObservatoryScan).
+ * The scan-runner's reconcile must only auto-resolve findings in this namespace.
+ * Declared before performanceScanner to avoid TDZ (temporal dead zone) errors.
+ */
+export const PERF_PROVIDER_RULE_IDS = [
+  "slow-ttfb",
+  "slow-fcp",
+  "slow-lcp",
+  "high-cls",
+  "slow-load",
+] as const;
+
 export const performanceScanner: ScannerProvider = {
   key: "observatory_performance",
   name: "Observatory Performance Scanner (built-in)",
   assessmentTypes: ["performance"],
+  // Declare the namespace of rule IDs this provider can produce so the scan
+  // runner's auto-resolve never touches findings from the dedicated /performance-scan
+  // SLA route (which uses a completely different rule-ID set).
+  ownedRuleIds: PERF_PROVIDER_RULE_IDS,
 
   async isAvailable(): Promise<boolean> {
     return true;
@@ -509,3 +539,4 @@ export interface PerfScannerFinding {
   /** Threshold value (formatted for display). */
   threshold: string;
 }
+
