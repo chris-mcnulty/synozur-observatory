@@ -48,6 +48,7 @@ import {
 import { z } from "zod";
 import { completeForFeature } from "../services/ai-provider";
 import { securityScanner } from "../services/security-scanner";
+import { computeScanReconciliation } from "../services/scan-reconciliation";
 import { enqueueScan, getJobStatusByLabel } from "../services/job-queue";
 
 // ── helpers (mirror server/routes/observatory.ts) ───────────────────────────
@@ -915,122 +916,87 @@ export function registerObservatoryModuleRoutes(app: Express) {
               ),
             );
 
-          // Primary lookup: scanRuleId → row (for findings that already have one)
-          const existingByRuleId = new Map(
-            existingRows
-              .filter((r) => r.scanRuleId != null)
-              .map((r) => [r.scanRuleId as string, r]),
-          );
-
-          // Fallback lookup: title → row for legacy findings without a scanRuleId.
-          // Use the first match per title; duplicates from before this fix are
-          // handled naturally (only the matched row is updated; extras remain open
-          // and can be cleaned up manually or via the delete UI).
-          const legacyByTitle = new Map(
-            existingRows
-              .filter((r) => r.scanRuleId == null)
-              .map((r) => [r.title, r]),
-          );
-
-          // Track which rule IDs the current scan returned (for stale-resolution)
-          const returnedRuleIds = new Set(scanResult.findings.map((f) => f.ruleId));
+          // Compute reconciliation plan (pure, testable — no DB calls)
+          const plan = computeScanReconciliation(existingRows, scanResult.findings, scanFailed);
 
           let inserted = 0;
           let updated = 0;
           let resolved = 0;
 
-          // Upsert each finding returned by the scanner
-          for (const sf of scanResult.findings) {
+          // Apply updates for existing findings
+          for (const op of plan.toUpdate) {
             try {
-              const existing = existingByRuleId.get(sf.ruleId) ?? legacyByTitle.get(sf.title);
-              if (existing) {
-                // Finding already exists — update description/severity/rule metadata but
-                // NEVER override a human decision. "remediated", "accepted_risk",
-                // "false_positive", and "in_progress" are all preserved unchanged.
-                // Only leave "open" findings as "open"; everything else stays as-is.
-                const newStatus = existing.status === "open" ? "open" : existing.status;
-                await db
-                  .update(obsFindings)
-                  .set({
-                    title: sf.title,
-                    description: sf.description ?? null,
-                    severity: sf.severity,
-                    cweId: sf.cweId ?? null,
-                    stepsToReproduce: sf.location?.url
-                      ? `Checked URL: ${sf.location.url}`
-                      : null,
-                    // Backfill scanRuleId for legacy rows that were matched by title
-                    scanRuleId: sf.ruleId,
-                    status: newStatus,
-                    resolvedAt: newStatus === "open" && existing.status === "remediated" ? null : undefined,
-                    updatedAt: new Date(),
-                  })
-                  .where(eq(obsFindings.id, existing.findingId));
-
-                // Move into the ruleId map so stale-resolution sees it correctly
-                existingByRuleId.set(sf.ruleId, { ...existing, scanRuleId: sf.ruleId });
-                updated++;
-              } else {
-                // Genuinely new finding — insert it and link to this pen test
-                const [finding] = await db
-                  .insert(obsFindings)
-                  .values({
-                    tenantDomain: penTest.tenantDomain,
-                    assessmentId: penTest.assessmentId,
-                    applicationId: penTest.applicationId,
-                    versionId: penTest.assessment.versionId ?? null,
-                    title: sf.title,
-                    description: sf.description ?? null,
-                    severity: sf.severity,
-                    domain: "security",
-                    status: "open",
-                    recommendation: null,
-                    affectedComponent: "Automated Scan",
-                    stepsToReproduce: sf.location?.url
-                      ? `Checked URL: ${sf.location.url}`
-                      : null,
-                    cweId: sf.cweId ?? null,
-                    scanRuleId: sf.ruleId,
-                    createdBy: null,
-                  })
-                  .returning({ id: obsFindings.id });
-
-                await db.insert(obsPenTestFindings).values({
-                  tenantDomain: penTest.tenantDomain,
-                  penTestId: penTest.id,
-                  findingId: finding.id,
-                  exploitability: null,
-                  validationStatus: "Not Started",
-                });
-
-                inserted++;
-              }
+              await db
+                .update(obsFindings)
+                .set({
+                  title: op.finding.title,
+                  description: op.finding.description ?? null,
+                  severity: op.finding.severity,
+                  cweId: op.finding.cweId ?? null,
+                  stepsToReproduce: op.finding.location?.url
+                    ? `Checked URL: ${op.finding.location.url}`
+                    : null,
+                  // Backfill scanRuleId for legacy rows that were matched by title
+                  scanRuleId: op.finding.ruleId,
+                  status: op.newStatus,
+                  resolvedAt: op.newStatus === "open" && op.row.status === "remediated" ? null : undefined,
+                  updatedAt: new Date(),
+                })
+                .where(eq(obsFindings.id, op.row.findingId));
+              updated++;
             } catch (err: any) {
-              console.error(`[SecurityScan] Failed to upsert finding "${sf.title}" (${sf.ruleId}):`, err.message);
+              console.error(`[SecurityScan] Failed to update finding "${op.finding.title}" (${op.finding.ruleId}):`, err.message);
             }
           }
 
-          // Auto-resolve findings whose rule was not returned — but ONLY for a
-          // successful scan.  A failed scan (target-unreachable) must never clear
-          // the existing register; a transient outage is not a fix.
-          if (!scanFailed) {
-            const staleRuleIds = [...existingByRuleId.keys()].filter((rid) => !returnedRuleIds.has(rid));
-            if (staleRuleIds.length > 0) {
-              // Only auto-resolve findings that are still "open" — never touch
-              // remediated, accepted_risk, false_positive, or in_progress rows.
-              const staleFindingIds = staleRuleIds
-                .map((rid) => existingByRuleId.get(rid)!)
-                .filter((r) => r.status === "open")
-                .map((r) => r.findingId);
+          // Insert genuinely new findings and link them to this pen test
+          for (const sf of plan.toInsert) {
+            try {
+              const [finding] = await db
+                .insert(obsFindings)
+                .values({
+                  tenantDomain: penTest.tenantDomain,
+                  assessmentId: penTest.assessmentId,
+                  applicationId: penTest.applicationId,
+                  versionId: penTest.assessment.versionId ?? null,
+                  title: sf.title,
+                  description: sf.description ?? null,
+                  severity: sf.severity,
+                  domain: "security",
+                  status: "open",
+                  recommendation: null,
+                  affectedComponent: "Automated Scan",
+                  stepsToReproduce: sf.location?.url
+                    ? `Checked URL: ${sf.location.url}`
+                    : null,
+                  cweId: sf.cweId ?? null,
+                  scanRuleId: sf.ruleId,
+                  createdBy: null,
+                })
+                .returning({ id: obsFindings.id });
 
-              if (staleFindingIds.length > 0) {
-                await db
-                  .update(obsFindings)
-                  .set({ status: "remediated", resolvedAt: new Date(), updatedAt: new Date() })
-                  .where(inArray(obsFindings.id, staleFindingIds));
-                resolved = staleFindingIds.length;
-              }
+              await db.insert(obsPenTestFindings).values({
+                tenantDomain: penTest.tenantDomain,
+                penTestId: penTest.id,
+                findingId: finding.id,
+                exploitability: null,
+                validationStatus: "Not Started",
+              });
+
+              inserted++;
+            } catch (err: any) {
+              console.error(`[SecurityScan] Failed to insert finding "${sf.title}" (${sf.ruleId}):`, err.message);
             }
+          }
+
+          // Auto-resolve stale findings (only open ones; only on successful scans)
+          if (plan.toResolve.length > 0) {
+            const staleFindingIds = plan.toResolve.map((r) => r.findingId);
+            await db
+              .update(obsFindings)
+              .set({ status: "remediated", resolvedAt: new Date(), updatedAt: new Date() })
+              .where(inArray(obsFindings.id, staleFindingIds));
+            resolved = staleFindingIds.length;
           }
 
           await db
