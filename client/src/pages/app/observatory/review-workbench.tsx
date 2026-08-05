@@ -13,7 +13,7 @@ import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useUser } from "@/lib/userContext";
 import { Link, useParams } from "wouter";
-import { ArrowLeft, CheckCircle2, Loader2, NotebookPen, Paperclip, Plus, RefreshCw, ScanLine, Sparkles, Wand2, X } from "lucide-react";
+import { AlertTriangle, ArrowLeft, CheckCircle2, Loader2, NotebookPen, Paperclip, Plus, RefreshCw, ScanLine, Sparkles, Wand2, X } from "lucide-react";
 import {
   workbenchBySlug,
   REVIEW_STATUSES,
@@ -47,10 +47,11 @@ interface AssessmentDetail {
 }
 
 interface ScanJobStatus {
-  status: "active" | "pending" | "not_found";
+  status: "active" | "pending" | "not_found" | "failed";
   progress?: { percent?: number; phase?: string };
   runningSec?: number;
   queuePosition?: number;
+  errorMessage?: string;
 }
 
 interface SourceMeta {
@@ -90,59 +91,66 @@ export default function ObservatoryReviewWorkbench() {
 
   // ── Accessibility scan state ─────────────────────────────────────────────
   const isAccessibility = wb?.moduleKey === "accessibility";
-  const [scanPolling, setScanPolling] = useState(false);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Track open-finding count before scan starts so we can show a delta in the completion toast.
   const preScanOpenCountRef = useRef<number>(0);
+  // Track previous status to detect transitions
+  const prevScanStatusRef = useRef<string | undefined>(undefined);
 
   const { data: scanStatus, refetch: refetchScanStatus } = useQuery<ScanJobStatus>({
     queryKey: [`/api/observatory/assessments/${assessmentId}/scan-status`],
     enabled: !!assessmentId && isAccessibility,
-    refetchInterval: scanPolling ? 3000 : false,
+    // Back off poll interval as the scan runs longer to avoid hammering the endpoint.
+    // Stops automatically when status is not_found or failed.
+    refetchInterval: (query) => {
+      const s = (query.state.data as ScanJobStatus | undefined)?.status;
+      if (s !== "active" && s !== "pending") return false;
+      const runningSec = (query.state.data as ScanJobStatus | undefined)?.runningSec ?? 0;
+      if (runningSec > 60) return 10000;
+      if (runningSec > 30) return 5000;
+      return 3000;
+    },
   });
 
-  // When scan goes from active/pending → not_found, the job completed — refresh findings
-  const prevScanStatusRef = useRef<string | undefined>(undefined);
+  // Detect scan completion or failure transitions
   useEffect(() => {
     const prev = prevScanStatusRef.current;
     const curr = scanStatus?.status;
-    if ((prev === "active" || prev === "pending") && curr === "not_found") {
-      setScanPolling(false);
-      // Invalidate so we get fresh finding statuses for the delta toast.
-      queryClient.invalidateQueries({ predicate: (q) => String(q.queryKey[0]).startsWith("/api/observatory") });
-      // Read the refreshed items from cache after invalidation settles.
-      setTimeout(() => {
-        const freshItems: ReviewItem[] | undefined = queryClient.getQueryData([
-          `/api/observatory/assessments/${assessmentId}/review-items`,
-        ]);
-        const openAfter = (freshItems ?? [])
-          .flatMap((i) => i.findings)
-          .filter((f) => f.status === "open").length;
-        const preScanOpen = preScanOpenCountRef.current;
-        const resolved = Math.max(0, preScanOpen - openAfter);
-        const newFindings = Math.max(0, openAfter - preScanOpen + resolved);
-        const parts: string[] = [];
-        if (resolved > 0) parts.push(`${resolved} finding${resolved === 1 ? "" : "s"} auto-resolved`);
-        if (newFindings > 0) parts.push(`${newFindings} new finding${newFindings === 1 ? "" : "s"} detected`);
-        if (parts.length === 0) parts.push("No changes to open findings");
-        toast({ title: "Re-scan complete", description: parts.join(" · ") + "." });
-      }, 800);
+    if ((prev === "active" || prev === "pending") && curr && curr !== "active" && curr !== "pending") {
+      invalidate();
+      if (curr === "failed") {
+        toast({
+          title: "Scan failed",
+          description: scanStatus?.errorMessage ?? "The scan encountered an error. Please try again.",
+          variant: "destructive",
+        });
+      } else {
+        // Show resolved/new delta in the completion toast.
+        // Wait briefly for invalidate() refetches to settle before reading fresh data.
+        setTimeout(() => {
+          const freshItems: ReviewItem[] | undefined = queryClient.getQueryData([
+            `/api/observatory/assessments/${assessmentId}/review-items`,
+          ]);
+          const openAfter = (freshItems ?? [])
+            .flatMap((i) => i.findings)
+            .filter((f) => f.status === "open").length;
+          const preScanOpen = preScanOpenCountRef.current;
+          const resolved = Math.max(0, preScanOpen - openAfter);
+          const newFindings = Math.max(0, openAfter - preScanOpen + resolved);
+          const parts: string[] = [];
+          if (resolved > 0) parts.push(`${resolved} finding${resolved === 1 ? "" : "s"} auto-resolved`);
+          if (newFindings > 0) parts.push(`${newFindings} new finding${newFindings === 1 ? "" : "s"} detected`);
+          if (parts.length === 0) parts.push("No changes to open findings");
+          toast({ title: "Re-scan complete", description: parts.join(" · ") + "." });
+        }, 800);
+      }
     }
     prevScanStatusRef.current = curr;
   }, [scanStatus?.status]);
-
-  // Start polling as soon as the component mounts if a scan is already running
-  useEffect(() => {
-    if (scanStatus?.status === "active" || scanStatus?.status === "pending") {
-      setScanPolling(true);
-    }
-  }, []);
 
   const triggerScanMutation = useMutation({
     mutationFn: async () =>
       (await apiRequest("POST", `/api/observatory/assessments/${assessmentId}/scan`)).json(),
     onSuccess: () => {
-      setScanPolling(true);
       refetchScanStatus();
       toast({ title: "Scan queued", description: "Accessibility scan is running. Findings will appear here when complete." });
     },
@@ -465,8 +473,8 @@ export default function ObservatoryReviewWorkbench() {
           </div>
         </div>
 
-        {/* Scan status banner */}
-        {isAccessibility && scanStatus && scanStatus.status !== "not_found" && (
+        {/* Scan status banner — running */}
+        {isAccessibility && scanStatus && (scanStatus.status === "active" || scanStatus.status === "pending") && (
           <Card className="border-blue-500/30 bg-blue-500/5" data-testid="card-scan-status">
             <CardContent className="py-3 px-4 flex items-center gap-3">
               <Loader2 className="h-4 w-4 animate-spin text-blue-500 shrink-0" />
@@ -480,6 +488,21 @@ export default function ObservatoryReviewWorkbench() {
                   {scanStatus.status === "active"
                     ? `Running for ${scanStatus.runningSec ?? 0}s — WCAG 2.1/2.2 violations checked with axe-core${hasExistingFindings ? "; findings no longer detected will be auto-resolved" : ""}`
                     : `Position ${scanStatus.queuePosition ?? "—"} in queue`}
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Scan error banner — failed or lost */}
+        {isAccessibility && scanStatus?.status === "failed" && (
+          <Card className="border-destructive/40 bg-destructive/5" data-testid="card-scan-error">
+            <CardContent className="py-3 px-4 flex items-center gap-3">
+              <AlertTriangle className="h-4 w-4 text-destructive shrink-0" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-destructive">Scan failed</p>
+                <p className="text-xs text-muted-foreground">
+                  {scanStatus.errorMessage ?? "The scan encountered an error. Please try again."}
                 </p>
               </div>
             </CardContent>

@@ -1,4 +1,4 @@
-type JobType = "pdf" | "monitor" | "analysis" | "planner" | "scan" | "other";
+type JobType = "pdf" | "monitor" | "crawl" | "analysis" | "planner" | "scan" | "other";
 type JobStatus = "pending" | "active" | "completed" | "failed" | "timeout";
 
 /** Optional context passed alongside a job for DB persistence and display. */
@@ -207,109 +207,114 @@ function startJob(job: QueuedJob): void {
   job.abortController = abortController;
   activeJobs.set(job.id, job);
 
-  // Persist job start to DB (fire-and-forget; do not block the queue)
-  if (persistenceHooks) {
-    persistenceHooks.onCreate({
-      id: job.id,
-      type: job.type,
-      label: job.label,
-      status: "running",
-      startedAt: new Date(job.startedAt),
-      ctx: job.ctx,
-    }).then(dbRowId => {
-      job.dbRowId = dbRowId;
-    }).catch(err => {
-      console.error(`[JobQueue] Failed to persist job start for ${job.label}:`, err.message);
-    });
-  }
-
-  const timeoutHandle = setTimeout(() => {
-    if (activeJobs.has(job.id)) {
-      console.error(`[JobQueue] Job ${job.id} (${job.label}) timed out after ${job.timeoutMs / 1000}s - aborting`);
-      job.status = "timeout";
-      abortController.abort();
-      activeJobs.delete(job.id);
-      failedCount++;
-      if (persistenceHooks && job.dbRowId) {
-        persistenceHooks.onComplete(job.dbRowId, "failed", `Timed out after ${job.timeoutMs / 1000}s`).catch(() => {});
-      }
-      job.reject(new Error(`Job timed out after ${job.timeoutMs / 1000}s: ${job.label}`));
-      processQueue();
-    }
-  }, job.timeoutMs);
-
   console.log(`[JobQueue] Starting ${job.type}/${job.label} (active: ${activeJobs.size}/${config.maxConcurrent}, pending: ${pendingQueue.length})`);
 
   const reportProgress: ProgressReporter = (patch) => {
     job.progress = { ...(job.progress || {}), ...patch };
   };
 
-  job.work(abortController.signal, reportProgress)
-    .then(result => {
-      clearTimeout(timeoutHandle);
-      if (job.status === "timeout") return;
-      job.status = "completed";
-      job.completedAt = Date.now();
-      activeJobs.delete(job.id);
-      completedCount++;
-      const durationSec = ((job.completedAt - (job.startedAt || job.enqueuedAt)) / 1000).toFixed(1);
-      console.log(`[JobQueue] Completed ${job.type}/${job.label} in ${durationSec}s (active: ${activeJobs.size}, pending: ${pendingQueue.length})`);
-      if (persistenceHooks && job.dbRowId) {
-        persistenceHooks.onComplete(job.dbRowId, "completed").catch(() => {});
-      }
-      job.resolve(result);
-      processQueue();
-    })
-    .catch(err => {
-      clearTimeout(timeoutHandle);
-      if (job.status === "timeout") return;
-      activeJobs.delete(job.id);
-
-      // P3: Retry with exponential back-off (2s -> 4s -> 8s)
-      if (job.attempt < job.maxRetries) {
-        const nextAttempt = job.attempt + 1;
-        const delay = 2000 * Math.pow(2, job.attempt); // 2s, 4s, 8s
-        console.warn(`[JobQueue] Retrying ${job.type}/${job.label} (attempt ${nextAttempt}/${job.maxRetries}) in ${delay}ms — ${err.message}`);
-        job.attempt = nextAttempt;
-        job.status = "pending";
-        setTimeout(() => {
-          if (canStartJob(job.type)) {
-            startJob(job);
-          } else {
-            pendingQueue.push(job);
-          }
-        }, delay);
-        // Free the concurrency slot so other pending jobs can start immediately
-        processQueue();
-        return;
-      }
-
-      // Exhausted retries — move to dead-letter queue
-      job.status = "failed";
-      job.completedAt = Date.now();
-      failedCount++;
-      console.error(`[JobQueue] Failed ${job.type}/${job.label} after ${job.attempt + 1} attempts: ${err.message}`);
-
-      if (deadLetterStore.length >= MAX_DLQ_SIZE) {
-        deadLetterStore.shift(); // evict oldest
-      }
-      deadLetterStore.push({
-        jobId: job.id,
+  // Persist job start BEFORE running work so job.dbRowId is always set before
+  // onComplete can fire — even on immediate (< 1 ms) scan failures.
+  // Fire-and-forget from processQueue's perspective, but work only starts after
+  // the onCreate promise settles so there is no race on dbRowId.
+  const persistenceReady: Promise<void> = persistenceHooks
+    ? persistenceHooks.onCreate({
+        id: job.id,
         type: job.type,
         label: job.label,
-        error: err.message || String(err),
-        attempts: job.attempt + 1,
-        failedAt: Date.now(),
+        status: "running",
+        startedAt: new Date(job.startedAt),
         ctx: job.ctx,
-      });
-      console.warn(`[JobQueue] Job ${job.id} moved to dead-letter queue (${deadLetterStore.length} entries)`);
+      }).then(dbRowId => {
+        job.dbRowId = dbRowId;
+      }).catch(err => {
+        console.error(`[JobQueue] Failed to persist job start for ${job.label}:`, err.message);
+      })
+    : Promise.resolve();
 
-      if (persistenceHooks && job.dbRowId) {
-        persistenceHooks.onComplete(job.dbRowId, "failed", err.message).catch(() => {});
+  persistenceReady.then(() => {
+    const timeoutHandle = setTimeout(() => {
+      if (activeJobs.has(job.id)) {
+        console.error(`[JobQueue] Job ${job.id} (${job.label}) timed out after ${job.timeoutMs / 1000}s - aborting`);
+        job.status = "timeout";
+        abortController.abort();
+        activeJobs.delete(job.id);
+        failedCount++;
+        if (persistenceHooks && job.dbRowId) {
+          persistenceHooks.onComplete(job.dbRowId, "failed", `Timed out after ${job.timeoutMs / 1000}s`).catch(() => {});
+        }
+        job.reject(new Error(`Job timed out after ${job.timeoutMs / 1000}s: ${job.label}`));
+        processQueue();
       }
-      job.reject(err);
-      processQueue();
-    });
+    }, job.timeoutMs);
+
+    job.work(abortController.signal, reportProgress)
+      .then(result => {
+        clearTimeout(timeoutHandle);
+        if (job.status === "timeout") return;
+        job.status = "completed";
+        job.completedAt = Date.now();
+        activeJobs.delete(job.id);
+        completedCount++;
+        const durationSec = ((job.completedAt - (job.startedAt || job.enqueuedAt)) / 1000).toFixed(1);
+        console.log(`[JobQueue] Completed ${job.type}/${job.label} in ${durationSec}s (active: ${activeJobs.size}, pending: ${pendingQueue.length})`);
+        if (persistenceHooks && job.dbRowId) {
+          persistenceHooks.onComplete(job.dbRowId, "completed").catch(() => {});
+        }
+        job.resolve(result);
+        processQueue();
+      })
+      .catch(err => {
+        clearTimeout(timeoutHandle);
+        if (job.status === "timeout") return;
+        activeJobs.delete(job.id);
+
+        // P3: Retry with exponential back-off (2s -> 4s -> 8s)
+        if (job.attempt < job.maxRetries) {
+          const nextAttempt = job.attempt + 1;
+          const delay = 2000 * Math.pow(2, job.attempt); // 2s, 4s, 8s
+          console.warn(`[JobQueue] Retrying ${job.type}/${job.label} (attempt ${nextAttempt}/${job.maxRetries}) in ${delay}ms — ${err.message}`);
+          job.attempt = nextAttempt;
+          job.status = "pending";
+          setTimeout(() => {
+            if (canStartJob(job.type)) {
+              startJob(job);
+            } else {
+              pendingQueue.push(job);
+            }
+          }, delay);
+          // Free the concurrency slot so other pending jobs can start immediately
+          processQueue();
+          return;
+        }
+
+        // Exhausted retries — move to dead-letter queue
+        job.status = "failed";
+        job.completedAt = Date.now();
+        failedCount++;
+        console.error(`[JobQueue] Failed ${job.type}/${job.label} after ${job.attempt + 1} attempts: ${err.message}`);
+
+        if (deadLetterStore.length >= MAX_DLQ_SIZE) {
+          deadLetterStore.shift(); // evict oldest
+        }
+        deadLetterStore.push({
+          jobId: job.id,
+          type: job.type,
+          label: job.label,
+          error: err.message || String(err),
+          attempts: job.attempt + 1,
+          failedAt: Date.now(),
+          ctx: job.ctx,
+        });
+        console.warn(`[JobQueue] Job ${job.id} moved to dead-letter queue (${deadLetterStore.length} entries)`);
+
+        if (persistenceHooks && job.dbRowId) {
+          persistenceHooks.onComplete(job.dbRowId, "failed", err.message).catch(() => {});
+        }
+        job.reject(err);
+        processQueue();
+      });
+  });
 }
 
 export function enqueue<T>(
@@ -368,13 +373,13 @@ export function enqueueMonitor<T>(label: string, work: ((signal?: AbortSignal) =
 export function enqueueScan<T>(
   label: string,
   work: ((signal?: AbortSignal, reportProgress?: ProgressReporter) => Promise<T>) | (() => Promise<T>),
-  options?: { timeoutMs?: number; ctx?: JobContext },
+  options?: { timeoutMs?: number; ctx?: JobContext; maxRetries?: number },
 ): Promise<T> {
   return enqueue("scan", label, work, {
     priority: PRIORITY.scan,
     timeoutMs: options?.timeoutMs ?? 5 * 60 * 1000,
     ctx: options?.ctx,
-    maxRetries: 1, // Scans are expensive — only one retry
+    maxRetries: options?.maxRetries ?? 1, // Scans are expensive — only one retry by default
   });
 }
 

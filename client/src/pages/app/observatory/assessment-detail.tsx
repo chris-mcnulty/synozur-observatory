@@ -51,17 +51,25 @@ interface Detail {
 }
 
 interface ScanStatus {
-  status: "active" | "pending" | "not_found";
+  status: "active" | "pending" | "not_found" | "failed";
   scannable: boolean;
   progress?: { percent?: number; phase?: string };
   runningSec?: number;
   queuePosition?: number;
+  errorMessage?: string;
 }
 
 const SCANNABLE_TYPES = new Set(["accessibility", "penetration_test", "performance"]);
 
 function ScanStatusBadge({ scanStatus }: { scanStatus: ScanStatus | undefined }) {
   if (!scanStatus || scanStatus.status === "not_found") return null;
+  if (scanStatus.status === "failed") {
+    return (
+      <Badge variant="destructive" className="gap-1">
+        <AlertTriangle className="h-3 w-3" /> Scan failed
+      </Badge>
+    );
+  }
   if (scanStatus.status === "pending") {
     return (
       <Badge variant="secondary" className="gap-1">
@@ -99,23 +107,39 @@ export default function ObservatoryAssessmentDetail() {
     ? `/api/observatory/assessments/${id}/performance-scan`
     : `/api/observatory/assessments/${id}/scan`;
 
+  // Track whether we were polling so we can detect scan completion/failure transitions
   const [scanPolling, setScanPolling] = useState(false);
   const { data: scanStatus } = useQuery<ScanStatus>({
     queryKey: [scanStatusUrl],
     enabled: !!assessment && SCANNABLE_TYPES.has(assessment.type),
-    refetchInterval: scanPolling ? 2000 : false,
+    // Back off the poll interval as the scan runs longer to avoid hammering the endpoint
+    refetchInterval: (query) => {
+      const s = (query.state.data as ScanStatus | undefined)?.status;
+      if (s !== "active" && s !== "pending") return false;
+      const runningSec = (query.state.data as ScanStatus | undefined)?.runningSec ?? 0;
+      if (runningSec > 60) return 10000;
+      if (runningSec > 30) return 5000;
+      return 2000;
+    },
   });
 
-  // Start/stop polling based on job status
+  // Detect transitions: running → completed or running → failed
   useEffect(() => {
     if (!scanStatus) return;
     const running = scanStatus.status === "active" || scanStatus.status === "pending";
-    setScanPolling(running);
-    // When scan finishes (transitions from running → not_found), reload findings
     if (!running && scanPolling) {
       queryClient.invalidateQueries({ predicate: (q) => String(q.queryKey[0]).startsWith("/api/observatory") });
-      toast({ title: "Scan complete", description: "Findings have been updated." });
+      if (scanStatus.status === "failed") {
+        toast({
+          title: "Scan failed",
+          description: scanStatus.errorMessage ?? "The scan encountered an error. Please try again.",
+          variant: "destructive",
+        });
+      } else {
+        toast({ title: "Scan complete", description: "Findings have been updated." });
+      }
     }
+    setScanPolling(running);
   }, [scanStatus?.status]);
 
   const triggerScan = useMutation({
@@ -275,8 +299,26 @@ export default function ObservatoryAssessmentDetail() {
           </div>
         </div>
 
+        {/* Scan error banner — shown when the scan fails or the job is lost */}
+        {isScannable && scanStatus?.status === "failed" && (
+          <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 flex items-center gap-3" data-testid="card-scan-error">
+            <AlertTriangle className="h-5 w-5 text-destructive flex-shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-destructive">Scan failed</p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {scanStatus.errorMessage ?? "The scan encountered an error. Please try again."}
+              </p>
+            </div>
+            {canWrite && (
+              <Button size="sm" variant="outline" onClick={() => triggerScan.mutate()} disabled={triggerScan.isPending}>
+                <ScanLine className="h-4 w-4 mr-1" /> Re-scan
+              </Button>
+            )}
+          </div>
+        )}
+
         {/* Scan intro banner — shown for scannable types with no findings yet */}
-        {isScannable && assessment.findings.length === 0 && !scanRunning && (
+        {isScannable && assessment.findings.length === 0 && !scanRunning && scanStatus?.status !== "failed" && (
           <div className="rounded-lg border border-primary/20 bg-primary/5 px-4 py-3 flex items-center gap-3">
             <ScanLine className="h-5 w-5 text-primary flex-shrink-0" />
             <div className="flex-1 min-w-0">

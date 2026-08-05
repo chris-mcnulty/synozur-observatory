@@ -150,7 +150,7 @@ vi.mock("../../services/accessibility-scanner", () => ({
 
 import { registerObservatoryRoutes, selectOrphanedEvidenceIds } from "../../routes/observatory";
 import { getRequestContext } from "../../context";
-import { enqueueScan } from "../job-queue";
+import { enqueueScan, getJobStatusByLabel } from "../job-queue";
 
 // ── Shared test fixtures ─────────────────────────────────────────────────────
 
@@ -1234,6 +1234,127 @@ describe("observatory routes", () => {
 
       expect(res.status).toBe(200);
       expect(res.body).toEqual([]);
+    });
+  });
+
+  // ── GET /api/observatory/assessments/:id/scan-status ──────────────────────
+  //
+  // Regression guard for the Autoscale-recycle bug: the in-memory job queue
+  // is lost when the server instance recycles.  The endpoint must fall back to
+  // scheduled_job_runs so the UI shows a real failure message instead of
+  // spinning forever.
+
+  describe("GET /api/observatory/assessments/:id/scan-status", () => {
+    it("returns active status directly when the job is found in memory", async () => {
+      vi.mocked(getJobStatusByLabel).mockReturnValue({
+        status: "active",
+        runningSec: 42,
+      } as any);
+
+      pushDb({ type: "accessibility", status: "in_progress" }); // assessment select
+
+      const res = await request(app).get("/api/observatory/assessments/asmnt-1/scan-status");
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("active");
+      expect(res.body.runningSec).toBe(42);
+      // scheduledJobRuns was NOT consulted (queue returned a live result)
+      expect(dbQ).toHaveLength(0);
+    });
+
+    it("returns failed with the DB error message when the job is gone but scheduled_job_runs has a recent failure", async () => {
+      // Default mock already returns not_found; make it explicit for clarity.
+      vi.mocked(getJobStatusByLabel).mockReturnValue({ status: "not_found" } as any);
+
+      pushDb({ type: "accessibility", status: "planned" }); // assessment select
+      // scheduled_job_runs fallback returns a recent failed run
+      pushDb({ status: "failed", errorMessage: "Puppeteer crashed: signal SIGTERM" });
+
+      const res = await request(app).get("/api/observatory/assessments/asmnt-1/scan-status");
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("failed");
+      expect(res.body.errorMessage).toBe("Puppeteer crashed: signal SIGTERM");
+      expect(dbQ).toHaveLength(0);
+    });
+
+    it("uses a generic 'server restarted' message when job is gone, assessment is in_progress, and no DB failure row exists", async () => {
+      vi.mocked(getJobStatusByLabel).mockReturnValue({ status: "not_found" } as any);
+
+      pushDb({ type: "accessibility", status: "in_progress" }); // assessment select
+      pushDb(); // scheduled_job_runs returns nothing (instance recycled before DB write)
+
+      const res = await request(app).get("/api/observatory/assessments/asmnt-1/scan-status");
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("failed");
+      expect(res.body.errorMessage).toMatch(/server may have restarted/i);
+      expect(dbQ).toHaveLength(0);
+    });
+
+    it("returns the queue timeout message when the job timed out and scheduled_job_runs recorded the timeout failure", async () => {
+      // This test verifies the Autoscale/timeout scenario end-to-end through the
+      // status endpoint contract: the queue writes "Timed out after Xs" to
+      // scheduled_job_runs; the endpoint must surface that message so the UI
+      // shows "Scan failed: Timed out after 120s" instead of spinning forever.
+      vi.mocked(getJobStatusByLabel).mockReturnValue({ status: "not_found" } as any);
+
+      pushDb({ type: "accessibility", status: "planned" }); // assessment select
+      // The queue's timeout handler writes this to scheduled_job_runs
+      pushDb({ status: "failed", errorMessage: "Timed out after 120s" });
+
+      const res = await request(app).get("/api/observatory/assessments/asmnt-1/scan-status");
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("failed");
+      expect(res.body.errorMessage).toBe("Timed out after 120s");
+      expect(dbQ).toHaveLength(0);
+    });
+
+    it("returns not_found when job is gone, assessment is not in_progress, and no recent failure exists", async () => {
+      vi.mocked(getJobStatusByLabel).mockReturnValue({ status: "not_found" } as any);
+
+      pushDb({ type: "accessibility", status: "completed" }); // assessment select
+      pushDb(); // scheduled_job_runs returns nothing
+
+      const res = await request(app).get("/api/observatory/assessments/asmnt-1/scan-status");
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("not_found");
+      expect(dbQ).toHaveLength(0);
+    });
+
+    it("returns 404 when the assessment does not exist for this tenant", async () => {
+      vi.mocked(getJobStatusByLabel).mockReturnValue({ status: "not_found" } as any);
+
+      pushDb(); // assessment select returns []
+
+      const res = await request(app).get("/api/observatory/assessments/nonexistent/scan-status");
+
+      expect(res.status).toBe(404);
+    });
+
+    it("collision guard: a failed performance-scan job for the same assessment does not pollute the accessibility scan-status response", async () => {
+      // Both the accessibility and performance scan endpoints use the same
+      // assessmentId as targetId, but the DB fallback now filters by jobLabel.
+      // A performance scan failure (label: "scan:performance:asmnt-1") must NOT
+      // appear on the accessibility scan-status endpoint (label: "scan:accessibility:asmnt-1").
+      //
+      // In this test the DB mock is set up to return [] (no row) when queried
+      // by the accessibility label — simulating the correct label-based filter.
+      vi.mocked(getJobStatusByLabel).mockReturnValue({ status: "not_found" } as any);
+
+      pushDb({ type: "accessibility", status: "completed" }); // assessment select
+      // DB returns nothing for the accessibility label (performance failure exists
+      // but is scoped to a different label — the mock returns [] here)
+      pushDb(); // scheduledJobRuns filtered by label "scan:accessibility:asmnt-1" → []
+
+      const res = await request(app).get("/api/observatory/assessments/asmnt-1/scan-status");
+
+      expect(res.status).toBe(200);
+      // Must NOT return failed (would be wrong — accessibility scan didn't fail)
+      expect(res.body.status).toBe("not_found");
+      expect(dbQ).toHaveLength(0);
     });
   });
 });

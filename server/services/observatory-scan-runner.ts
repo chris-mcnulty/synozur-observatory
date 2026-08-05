@@ -95,13 +95,16 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
   const targetUrl = urlCheck.normalizedUrl ?? rawTargetUrl;
 
   // ── 2. Find scanner ───────────────────────────────────────────────────────
-  const scanner = await findScannerForType(assessment.type, tenantDomain);
-  if (!scanner) {
+  const scannerOrNull = await findScannerForType(assessment.type, tenantDomain);
+  if (!scannerOrNull) {
     throw new Error(
       `No scanner is available for assessment type "${assessment.type}". ` +
       `Supported types: accessibility, penetration_test, performance.`,
     );
   }
+  // Capture in a non-nullable const so TypeScript can narrow inside the inner
+  // executeScan() closure (narrowing is not carried across function boundaries).
+  const scanner = scannerOrNull;
 
   // ── 3. Mark assessment in_progress ───────────────────────────────────────
   // Remember the prior status so a failed/timed-out scan can restore it instead

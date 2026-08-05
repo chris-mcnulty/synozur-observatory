@@ -10,7 +10,7 @@
  *     — includes a "Source" column (Manual / Auto) to distinguish runs
  *   - Each completed scan links to findings it created
  */
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
@@ -27,7 +27,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Loader2, Play, Settings, CheckCircle2, XCircle, Clock, AlertTriangle, CalendarClock } from "lucide-react";
+import { Loader2, Play, Settings, CheckCircle2, XCircle, Clock, AlertTriangle, CalendarClock, AlertCircle } from "lucide-react";
 import { formatDate } from "@/lib/utils";
 
 interface PerfScan {
@@ -155,14 +155,21 @@ export default function PerformanceScanPanel({
     },
   });
 
-  // Poll job queue status
-  const { data: jobStatus } = useQuery<{ status: "active" | "pending" | "not_found" }>({
+  // Poll job queue status — backs off and stops at terminal states.
+  const { data: jobStatus } = useQuery<{ status: "active" | "pending" | "not_found" | "failed"; errorMessage?: string }>({
     queryKey: [`/api/observatory/assessments/${assessmentId}/performance-scan/status`],
-    refetchInterval: 5000,
+    refetchInterval: (query) => {
+      const s = (query.state.data as { status: string } | undefined)?.status;
+      if (s === "failed" || s === "not_found") return false; // terminal — stop polling
+      if (s === "active" || s === "pending") return 3000;
+      return 5000; // default while status unknown
+    },
   });
 
-  const isScanRunning = jobStatus?.status === "active" || jobStatus?.status === "pending"
+  const isScanRunning = (jobStatus?.status === "active" || jobStatus?.status === "pending")
     || scans.some((s) => s.status === "running");
+
+  const scanFailed = jobStatus?.status === "failed";
 
   const invalidate = () => {
     queryClient.invalidateQueries({ predicate: (q) => String(q.queryKey[0]).startsWith("/api/observatory") });
@@ -206,10 +213,47 @@ export default function PerformanceScanPanel({
     onError: (err: Error) => toast({ title: "Save failed", description: err.message, variant: "destructive" }),
   });
 
+  // Show a destructive toast once when the scan transitions to failed.
+  const prevJobStatusRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (jobStatus?.status === "failed" && prevJobStatusRef.current !== "failed") {
+      toast({
+        title: "Performance scan failed",
+        description: jobStatus.errorMessage ?? "The scan encountered an error. Please try again.",
+        variant: "destructive",
+      });
+    }
+    prevJobStatusRef.current = jobStatus?.status;
+  }, [jobStatus?.status, jobStatus?.errorMessage, toast]);
+
   const latestCompleted = scans.find((s) => s.status === "completed");
 
   return (
     <div className="space-y-4">
+      {/* Scan failure banner — shown when the job queue reports a terminal failure */}
+      {scanFailed && (
+        <div className="flex items-start gap-3 rounded-md border border-red-600/40 bg-red-600/10 px-4 py-3 text-sm text-red-300">
+          <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-red-400" />
+          <div className="flex-1 min-w-0">
+            <p className="font-medium text-red-300">Performance scan failed</p>
+            <p className="text-xs text-red-400/80 mt-0.5 break-words">
+              {jobStatus?.errorMessage ?? "The scan encountered an error. Please try again."}
+            </p>
+          </div>
+          {canWrite && (
+            <Button
+              size="sm"
+              variant="destructive"
+              className="shrink-0 h-7 text-xs"
+              onClick={() => triggerScan.mutate()}
+              disabled={triggerScan.isPending}
+            >
+              Re-scan
+            </Button>
+          )}
+        </div>
+      )}
+
       {/* Header toolbar */}
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <div>

@@ -13,7 +13,7 @@ import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useUser } from "@/lib/userContext";
 import { Link, useParams } from "wouter";
-import { ArrowLeft, Link2, Loader2, Plus, ScanLine, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Link2, Loader2, Plus, ScanLine, Trash2 } from "lucide-react";
 import {
   PEN_TEST_RESULTS,
   VALIDATION_STATUSES,
@@ -181,12 +181,17 @@ export default function ObservatoryPenTestDetail() {
   });
 
   // Poll scan status while a job is running so the UI updates automatically
-  const { data: scanStatus } = useQuery<{ status: "active" | "pending" | "not_found"; progress?: { phase?: string } }>({
+  const { data: scanStatus } = useQuery<{ status: "active" | "pending" | "not_found" | "failed"; progress?: { phase?: string }; runningSec?: number; errorMessage?: string }>({
     queryKey: [`/api/observatory/pen-tests/${id}/security-scan/status`],
     enabled: !!id,
+    // Back off poll interval as scan runs longer to avoid hammering the endpoint
     refetchInterval: (query) => {
       const s = query.state.data?.status;
-      return s === "active" || s === "pending" ? 3000 : false;
+      if (s !== "active" && s !== "pending") return false;
+      const runningSec = query.state.data?.runningSec ?? 0;
+      if (runningSec > 60) return 10000;
+      if (runningSec > 30) return 5000;
+      return 3000;
     },
     // When a running scan transitions to not_found it has finished — refresh findings
     select: (data) => {
@@ -198,6 +203,7 @@ export default function ObservatoryPenTestDetail() {
   });
 
   const scanRunning = scanStatus?.status === "active" || scanStatus?.status === "pending";
+  const scanFailed = scanStatus?.status === "failed";
 
   if (isLoading || !penTest) {
     return (
@@ -268,6 +274,21 @@ export default function ObservatoryPenTestDetail() {
             </Link>
           </div>
         </div>
+
+        {/* Scan error banner */}
+        {scanFailed && (
+          <Card className="border-destructive/40 bg-destructive/5" data-testid="card-scan-error">
+            <CardContent className="py-3 px-4 flex items-center gap-3">
+              <AlertTriangle className="h-4 w-4 text-destructive shrink-0" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-destructive">Scan failed</p>
+                <p className="text-xs text-muted-foreground">
+                  {scanStatus?.errorMessage ?? "The scan encountered an error. Please try again."}
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-2 text-sm">
           <div><span className="text-muted-foreground">Methodology:</span> {penTest.methodology ?? "—"}</div>

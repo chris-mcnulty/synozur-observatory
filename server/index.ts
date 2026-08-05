@@ -270,6 +270,7 @@ app.use((req, res, next) => {
           .insert(scheduledJobRuns)
           .values({
             jobType: job.type,
+            jobLabel: job.label,
             tenantDomain: job.ctx?.tenantDomain || null,
             targetId: job.ctx?.targetId || null,
             targetName: job.ctx?.targetName || job.label,

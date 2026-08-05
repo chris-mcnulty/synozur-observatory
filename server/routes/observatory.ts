@@ -12,7 +12,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { db } from "../db";
-import { and, desc, eq, ilike, inArray, or, sql, asc } from "drizzle-orm";
+import { and, desc, eq, gte, ilike, inArray, or, sql, asc } from "drizzle-orm";
 import { getRequestContext, ContextError, type RequestContext } from "../context";
 import { hasAdminAccess, hasContentAccess } from "./helpers";
 import { ObjectStorageService, ObjectNotFoundError } from "../replit_integrations/object_storage/objectStorage";
@@ -31,6 +31,7 @@ import {
   obsReviewItemEvidence,
   obsFindingControls,
   obsAuditLogs,
+  scheduledJobRuns,
   insertObsApplicationSchema,
   insertObsVersionSchema,
   insertObsAssessmentSchema,
@@ -1324,6 +1325,19 @@ export function registerObservatoryRoutes(app: Express) {
   /**
    * GET /api/observatory/assessments/:id/scan-status
    * Poll the status of an in-flight scan job for the given assessment.
+   *
+   * Falls back to scheduled_job_runs when the in-memory job is not found so
+   * the UI can show the real failure reason instead of spinning forever. This
+   * covers two scenarios:
+   *   (a) Normal failure — runObservatoryScan throws/times out, restores the
+   *       assessment status, removes the job from memory. The scheduled_job_runs
+   *       row has status="failed" with errorMessage.
+   *   (b) Autoscale instance recycle — job is lost from memory while the
+   *       assessment is still in_progress. No DB failure row exists, so we
+   *       surface a generic "server restarted" message.
+   *
+   * Recency guard (30 min): avoids surfacing a stale failure from an old scan
+   * after a later successful scan has completed and the job is long gone.
    */
   app.get("/api/observatory/assessments/:id/scan-status", async (req, res) => {
     const ctx = await ctxOr401(req, res);
@@ -1331,7 +1345,7 @@ export function registerObservatoryRoutes(app: Express) {
 
     const assessmentId = req.params.id;
     const [assessment] = await db
-      .select({ type: obsAssessments.type })
+      .select({ type: obsAssessments.type, status: obsAssessments.status })
       .from(obsAssessments)
       .where(and(eq(obsAssessments.id, assessmentId), eq(obsAssessments.tenantDomain, ctx.tenantDomain)));
 
@@ -1339,6 +1353,54 @@ export function registerObservatoryRoutes(app: Express) {
 
     const scanLabel = `scan:${assessment.type}:${assessmentId}`;
     const jobStatus = getJobStatusByLabel(scanLabel, ctx.tenantDomain);
+
+    // If the job is found in memory, return it directly.
+    if (jobStatus.status !== "not_found") {
+      return res.json({ ...jobStatus, label: scanLabel, scannable: SCANNABLE_TYPES.has(assessment.type) });
+    }
+
+    // Job not in memory — check scheduled_job_runs for a recent (< 30 min)
+    // failed run for this assessment. This surfaces real error messages after
+    // a scan throws or times out (runObservatoryScan restores assessment status
+    // on failure, so checking assessment.status === "in_progress" is wrong).
+    const recentCutoff = new Date(Date.now() - 30 * 60 * 1000);
+    const [latestRun] = await db
+      .select({
+        status: scheduledJobRuns.status,
+        errorMessage: scheduledJobRuns.errorMessage,
+        startedAt: scheduledJobRuns.startedAt,
+      })
+      .from(scheduledJobRuns)
+      .where(
+        and(
+          eq(scheduledJobRuns.jobLabel, scanLabel),
+          eq(scheduledJobRuns.tenantDomain, ctx.tenantDomain),
+          gte(scheduledJobRuns.startedAt, recentCutoff),
+        ),
+      )
+      .orderBy(desc(scheduledJobRuns.startedAt))
+      .limit(1);
+
+    if (latestRun?.status === "failed") {
+      return res.json({
+        status: "failed",
+        errorMessage: latestRun.errorMessage ?? "The scan encountered an error. Please try again.",
+        label: scanLabel,
+        scannable: SCANNABLE_TYPES.has(assessment.type),
+      });
+    }
+
+    // Secondary fallback: no recent DB run but assessment is still in_progress
+    // — the job was lost mid-run (Autoscale instance recycle).
+    if (!latestRun && assessment.status === "in_progress") {
+      return res.json({
+        status: "failed",
+        errorMessage: "Scan job was lost — the server may have restarted. Please try scanning again.",
+        label: scanLabel,
+        scannable: SCANNABLE_TYPES.has(assessment.type),
+      });
+    }
+
     res.json({ ...jobStatus, label: scanLabel, scannable: SCANNABLE_TYPES.has(assessment.type) });
   });
 

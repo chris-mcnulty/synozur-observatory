@@ -2370,6 +2370,7 @@ export type InsertScheduledBriefingConfig = z.infer<typeof insertScheduledBriefi
 export const scheduledJobRuns = pgTable("scheduled_job_runs", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   jobType: text("job_type").notNull(), // websiteCrawl, socialMonitor, websiteMonitor, trialReminder, weeklyDigest
+  jobLabel: text("job_label"), // Unique job label from the queue (e.g. "scan:accessibility:asmnt-1")
   tenantDomain: text("tenant_domain"), // null for system-wide jobs
   targetId: varchar("target_id"), // competitorId, companyProfileId, etc.
   targetName: text("target_name"), // Human-readable name

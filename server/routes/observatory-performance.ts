@@ -20,7 +20,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { db } from "../db";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, gte } from "drizzle-orm";
 import { getRequestContext, ContextError, type RequestContext } from "../context";
 import { hasContentAccess } from "./helpers";
 import {
@@ -31,6 +31,7 @@ import {
   obsAssessmentEvidence,
   obsPerformanceScans,
   obsAuditLogs,
+  scheduledJobRuns,
 } from "@shared/schema";
 import { z } from "zod";
 import { enqueue, getJobStatusByLabel } from "../services/job-queue";
@@ -102,8 +103,8 @@ export function scanJobLabel(assessmentId: string): string {
 // ── Shared scan executor ──────────────────────────────────────────────────────
 //
 // Called by both the manual POST endpoint and the automated scheduler.
-// Creates findings with deduplication for scheduled runs (option b): if a scan
-// is scheduled-source, skip inserting a finding when an open finding with the
+// Creates findings with deduplication for scheduled runs: if a scan is
+// scheduled-source, skip inserting a finding when an open finding with the
 // same scanRuleId already exists for the assessment. Never touches human-set
 // finding statuses.
 
@@ -232,7 +233,7 @@ export async function executePerfScan(opts: ExecuteScanOptions): Promise<void> {
       .set({ status: "failed", scanError: err?.message ?? String(err) })
       .where(eq(obsPerformanceScans.id, scanRow.id))
       .catch(() => {});
-    throw err; // re-throw so the job queue can apply retries (maxRetries>0 for scheduled)
+    throw err; // re-throw so the job queue records failure in scheduled_job_runs
   }
 }
 
@@ -270,12 +271,44 @@ export function registerObservatoryPerformanceRoutes(app: Express) {
   /**
    * GET /api/observatory/assessments/:id/performance-scan/status
    * Poll the queue for an active or pending scan job.
+   * Falls back to scheduled_job_runs for a recent failed run so the UI stops
+   * spinning and shows the real error after a scan throws or times out.
    */
   app.get("/api/observatory/assessments/:id/performance-scan/status", async (req, res) => {
     const ctx = await ctxOr401(req, res);
     if (!ctx) return;
     try {
-      const status = getJobStatusByLabel(scanJobLabel(req.params.id), ctx.tenantDomain);
+      const assessmentId = req.params.id;
+      const status = getJobStatusByLabel(scanJobLabel(assessmentId), ctx.tenantDomain);
+      if (status.status !== "not_found") {
+        return res.json(status);
+      }
+
+      // Job not in memory — check for a recent (< 30 min) failed run, scoped
+      // to the exact job label so a concurrent accessibility scan failure for
+      // the same assessment cannot trigger a false performance-scan error.
+      const jobLabel = scanJobLabel(assessmentId);
+      const recentCutoff = new Date(Date.now() - 30 * 60 * 1000);
+      const [latestRun] = await db
+        .select({ status: scheduledJobRuns.status, errorMessage: scheduledJobRuns.errorMessage })
+        .from(scheduledJobRuns)
+        .where(
+          and(
+            eq(scheduledJobRuns.jobLabel, jobLabel),
+            eq(scheduledJobRuns.tenantDomain, ctx.tenantDomain),
+            gte(scheduledJobRuns.startedAt, recentCutoff),
+          ),
+        )
+        .orderBy(desc(scheduledJobRuns.startedAt))
+        .limit(1);
+
+      if (latestRun?.status === "failed") {
+        return res.json({
+          status: "failed",
+          errorMessage: latestRun.errorMessage ?? "The performance scan encountered an error. Please try again.",
+        });
+      }
+
       res.json(status);
     } catch (err) {
       console.error("[observatory-performance] scan status error:", err);
@@ -332,11 +365,13 @@ export function registerObservatoryPerformanceRoutes(app: Express) {
 
       // Resolve SLA config — priority: request body override → app's saved config → defaults.
       let slaConfig: PerfSlaConfig = DEFAULT_PERF_SLA;
+      // Apply the application's saved SLA config first (if set).
       const savedSla = (appRow as any).perfSlaConfig as Partial<PerfSlaConfig> | null;
       if (savedSla && typeof savedSla === "object") {
         const parsed = slaConfigSchema.safeParse({ ...DEFAULT_PERF_SLA, ...savedSla });
         if (parsed.success) slaConfig = parsed.data;
       }
+      // Request body can override the saved config (used by SLA dialog "Save & Scan" flows).
       if (req.body && Object.keys(req.body).length > 0) {
         const parsed = slaConfigSchema.safeParse({ ...slaConfig, ...req.body });
         if (parsed.success) slaConfig = parsed.data;

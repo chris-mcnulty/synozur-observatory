@@ -16,7 +16,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { db } from "../db";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { getRequestContext, ContextError, type RequestContext } from "../context";
 import { hasAdminAccess, hasContentAccess, logAiUsage } from "./helpers";
 import {
@@ -31,6 +31,7 @@ import {
   obsPenTests,
   obsPenTestFindings,
   obsAuditLogs,
+  scheduledJobRuns,
   insertObsSourceReviewMetaSchema,
   insertObsPenTestSchema,
   OBS_REVIEW_MODULES,
@@ -1143,13 +1144,44 @@ export function registerObservatoryModuleRoutes(app: Express) {
   /**
    * GET /api/observatory/pen-tests/:id/security-scan/status
    * Returns the current queue status of the security scan for this pen test.
+   * Falls back to scheduled_job_runs for a recent failed run so the UI stops
+   * spinning and shows the real error after a scan throws or times out.
    */
   app.get("/api/observatory/pen-tests/:id/security-scan/status", async (req, res) => {
     const ctx = await ctxOr401(req, res);
     if (!ctx) return;
     try {
-      const jobLabel = `security-scan:pen-test:${req.params.id}`;
+      const penTestId = req.params.id;
+      const jobLabel = `security-scan:pen-test:${penTestId}`;
       const status = getJobStatusByLabel(jobLabel, ctx.tenantDomain);
+      if (status.status !== "not_found") {
+        return res.json(status);
+      }
+
+      // Job not in memory — check for a recent (< 30 min) failed run, scoped
+      // to the exact job label so unrelated jobs sharing the same targetId
+      // cannot produce a false "scan failed" banner.
+      const recentCutoff = new Date(Date.now() - 30 * 60 * 1000);
+      const [latestRun] = await db
+        .select({ status: scheduledJobRuns.status, errorMessage: scheduledJobRuns.errorMessage })
+        .from(scheduledJobRuns)
+        .where(
+          and(
+            eq(scheduledJobRuns.jobLabel, jobLabel),
+            eq(scheduledJobRuns.tenantDomain, ctx.tenantDomain),
+            gte(scheduledJobRuns.startedAt, recentCutoff),
+          ),
+        )
+        .orderBy(desc(scheduledJobRuns.startedAt))
+        .limit(1);
+
+      if (latestRun?.status === "failed") {
+        return res.json({
+          status: "failed",
+          errorMessage: latestRun.errorMessage ?? "The security scan encountered an error. Please try again.",
+        });
+      }
+
       res.json(status);
     } catch (err) {
       handleError(res, err, "security scan status");
