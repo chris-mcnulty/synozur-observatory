@@ -5,9 +5,9 @@ description: How to verify auth-gated Orbit APIs when the browser preview only s
 
 # E2E API verification behind auth
 
-The app preview is login-gated, so screenshots can't verify app pages. Reliable pattern:
+The app preview is login-gated, so screenshots always show the login screen. Reliable verification pattern:
 
-- Log in via `POST /api/login` with curl (`-c cookies.txt`), then call APIs with the cookie jar plus the per-tab `X-Active-Tenant-Id` header. Use a dedicated test user; set a random temporary password hash via SQL and overwrite it with a fresh random hash when done so no known credential remains.
-- Frontend compile sanity without a browser: request the page module path from the Vite dev server — a 200 means it transforms cleanly.
-- The dev server does NOT hot-reload backend code — restart the workflow after editing server routes or you'll test stale code.
-- AI provider calls fail in this dev environment ("Replit AI Integrations is not configured", 404 across the whole model fallback chain) — a 500 from an AI endpoint here is usually environment, not code; confirm in logs that the route reached the provider call.
+- Log in via `POST /api/login` (not `/api/auth/login`) with curl; capture the `connect.sid` cookie from the `Set-Cookie` response header and pass it with `-H "Cookie: connect.sid=..."` on subsequent calls. The API auto-resolves the tenant from the user's email domain — no `X-Active-Tenant-Id` header needed.
+- Use a dedicated test user (`e2e-test@synozur.com`). Set a temporary bcrypt hash via SQL (`UPDATE users SET password = $hash WHERE email = ...`), run verification, then immediately overwrite with a fresh random hash so no known credential remains.
+- Restart the dev workflow after editing server-side code — the dev server does NOT hot-reload backend changes; stale handlers will mislead.
+- AI provider calls return 404/500 in this dev environment ("Replit AI Integrations is not configured") — confirm in logs that the route reached the provider call before treating it as a code bug.

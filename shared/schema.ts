@@ -5080,6 +5080,10 @@ export const obsAssessments = pgTable("obs_assessments", {
   outOfScope: text("out_of_scope"),
   executiveSummary: text("executive_summary"),
   overallScore: integer("overall_score"), // 0-100
+  /** Automated scan cadence for performance assessments: 'daily' | 'weekly' | 'disabled' */
+  scanSchedule: text("scan_schedule").notNull().default("disabled"),
+  /** Timestamp stamped by the scheduler before enqueueing each automated scan. */
+  lastAutoScanAt: timestamp("last_auto_scan_at"),
   createdBy: varchar("created_by").references(() => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
@@ -5765,6 +5769,8 @@ export const obsPerformanceScans = pgTable("obs_performance_scans", {
   /** ISO timestamp when the headless measurement was taken. */
   scannedAt: timestamp("scanned_at"),
   triggeredBy: varchar("triggered_by").references(() => users.id, { onDelete: "set null" }),
+  /** Whether the scan was triggered manually or by the automated scheduler. */
+  scanSource: text("scan_source").notNull().default("manual"), // 'manual' | 'scheduled'
   createdAt: timestamp("created_at").notNull().defaultNow(),
 }, (t) => ({
   tenantIdx: index("obs_perf_scans_tenant_idx").on(t.tenantDomain),

@@ -14,6 +14,9 @@
  *
  * PUT  /api/observatory/applications/:id/perf-sla
  *   Update the SLA threshold config for an application.
+ *
+ * PUT  /api/observatory/assessments/:id/scan-schedule
+ *   Set the automated scan cadence (daily / weekly / disabled).
  */
 import type { Express, Request, Response } from "express";
 import { db } from "../db";
@@ -37,6 +40,7 @@ import {
   type PerfSlaConfig,
 } from "../services/performance-scanner";
 import { assertScanUrlSafe } from "../services/ssrf-guard";
+import { shouldSkipFinding } from "../services/perf-scan-schedule-core";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -86,9 +90,150 @@ const slaConfigSchema = z.object({
   ttiMs: z.number().int().min(100).max(120_000).default(DEFAULT_PERF_SLA.ttiMs),
 });
 
+const scanScheduleSchema = z.object({
+  scanSchedule: z.enum(["daily", "weekly", "disabled"]),
+});
+
 /** Job label prefix for performance scans (used for deduplication / status polling). */
-function scanJobLabel(assessmentId: string): string {
+export function scanJobLabel(assessmentId: string): string {
   return `perf-scan:${assessmentId}`;
+}
+
+// ── Shared scan executor ──────────────────────────────────────────────────────
+//
+// Called by both the manual POST endpoint and the automated scheduler.
+// Creates findings with deduplication for scheduled runs (option b): if a scan
+// is scheduled-source, skip inserting a finding when an open finding with the
+// same scanRuleId already exists for the assessment. Never touches human-set
+// finding statuses.
+
+export interface ExecuteScanOptions {
+  tenantDomain: string;
+  assessment: { id: string; applicationId: string; versionId?: string | null; title: string };
+  scanRow: { id: string };
+  url: string;
+  slaConfig: PerfSlaConfig;
+  scanSource: "manual" | "scheduled";
+  triggeredByUserId: string | null;
+}
+
+export async function executePerfScan(opts: ExecuteScanOptions): Promise<void> {
+  const { tenantDomain, assessment, scanRow, url, slaConfig, scanSource } = opts;
+
+  try {
+    const { metrics, findings } = await runPerformanceScan(url, slaConfig, {
+      timeoutMs: 60_000,
+    });
+
+    // ── Finding dedup (scheduled only) ───────────────────────────────────────
+    // For scheduled scans, look up open findings by ruleId so we don't spam
+    // new finding rows for persistent SLA breaches. Never touch human statuses.
+    let openRuleIds = new Set<string>();
+    if (scanSource === "scheduled" && findings.length > 0) {
+      const existingFindings = await db
+        .select({ scanRuleId: obsFindings.scanRuleId })
+        .from(obsFindings)
+        .where(
+          and(
+            eq(obsFindings.assessmentId, assessment.id),
+            eq(obsFindings.status, "open"),
+          ),
+        );
+      openRuleIds = new Set(
+        existingFindings.map((f) => f.scanRuleId).filter(Boolean) as string[],
+      );
+    }
+
+    // Persist findings to obs_findings.
+    let findingCount = 0;
+    for (const f of findings) {
+      // Use pure helper: skip if scheduled and an open finding already exists for this rule.
+      if (shouldSkipFinding({ scanSource, ruleId: f.ruleId, openRuleIds })) {
+        continue;
+      }
+
+      try {
+        const [created] = await db
+          .insert(obsFindings)
+          .values({
+            tenantDomain,
+            assessmentId: assessment.id,
+            applicationId: assessment.applicationId,
+            versionId: assessment.versionId ?? null,
+            title: f.title,
+            description: f.description,
+            severity: f.severity,
+            domain: "performance",
+            status: "open",
+            recommendation: f.recommendation,
+            affectedComponent: url,
+            scanRuleId: f.ruleId ?? null,
+          })
+          .returning({ id: obsFindings.id });
+        findingCount++;
+
+        await db.insert(obsAuditLogs).values({
+          tenantDomain,
+          userId: null,
+          entityType: "finding",
+          entityId: created.id,
+          action: "create",
+          summary: `Performance scan (${scanSource}) created finding: ${f.title} (${f.severity})`,
+        }).catch(() => {});
+      } catch (findingErr) {
+        console.error("[perf-scan] Failed to persist finding:", findingErr);
+      }
+    }
+
+    // Store raw metrics as scan_report evidence linked to the assessment.
+    try {
+      const evidenceBody = JSON.stringify({ metrics, findings, slaConfig }, null, 2);
+      const [ev] = await db
+        .insert(obsEvidence)
+        .values({
+          tenantDomain,
+          title: `Performance Scan Report — ${new Date(metrics.scannedAt).toISOString().slice(0, 10)}`,
+          description: `Headless browser performance scan of ${url}. ${findingCount} SLA breach(es) found.`,
+          evidenceType: "scan_report",
+          source: "headless-browser",
+          collectedAt: new Date(metrics.scannedAt),
+        })
+        .returning({ id: obsEvidence.id });
+
+      await db
+        .insert(obsAssessmentEvidence)
+        .values({ assessmentId: assessment.id, evidenceId: ev.id })
+        .onConflictDoNothing();
+    } catch (evErr) {
+      console.error("[perf-scan] Failed to persist evidence:", evErr);
+    }
+
+    // Mark scan row completed with metrics.
+    await db
+      .update(obsPerformanceScans)
+      .set({
+        status: "completed",
+        ttfbMs: metrics.ttfbMs ?? null,
+        loadTimeMs: metrics.loadTimeMs ?? null,
+        lcpMs: metrics.lcpMs ?? null,
+        clsScore: metrics.clsScore ?? null,
+        ttiMs: metrics.ttiMs ?? null,
+        findingCount,
+        warnings: (metrics.warnings ?? []) as any,
+        scannedAt: new Date(metrics.scannedAt),
+      })
+      .where(eq(obsPerformanceScans.id, scanRow.id));
+
+    console.log(`[perf-scan] Completed ${scanSource} scan for assessment ${assessment.id}: ${findingCount} finding(s)`);
+  } catch (err: any) {
+    console.error(`[perf-scan] ${scanSource} scan failed for assessment ${assessment.id}:`, err);
+    await db
+      .update(obsPerformanceScans)
+      .set({ status: "failed", scanError: err?.message ?? String(err) })
+      .where(eq(obsPerformanceScans.id, scanRow.id))
+      .catch(() => {});
+    throw err; // re-throw so the job queue can apply retries (maxRetries>0 for scheduled)
+  }
 }
 
 // ── Route registration ────────────────────────────────────────────────────────
@@ -187,13 +332,11 @@ export function registerObservatoryPerformanceRoutes(app: Express) {
 
       // Resolve SLA config — priority: request body override → app's saved config → defaults.
       let slaConfig: PerfSlaConfig = DEFAULT_PERF_SLA;
-      // Apply the application's saved SLA config first (if set).
       const savedSla = (appRow as any).perfSlaConfig as Partial<PerfSlaConfig> | null;
       if (savedSla && typeof savedSla === "object") {
         const parsed = slaConfigSchema.safeParse({ ...DEFAULT_PERF_SLA, ...savedSla });
         if (parsed.success) slaConfig = parsed.data;
       }
-      // Request body can override the saved config (used by SLA dialog "Save & Scan" flows).
       if (req.body && Object.keys(req.body).length > 0) {
         const parsed = slaConfigSchema.safeParse({ ...slaConfig, ...req.body });
         if (parsed.success) slaConfig = parsed.data;
@@ -210,10 +353,11 @@ export function registerObservatoryPerformanceRoutes(app: Express) {
           status: "running",
           slaConfig,
           triggeredBy: ctx.userId,
+          scanSource: "manual",
         })
         .returning();
 
-      await audit(ctx, "performance_scan", scanRow.id, "create", `Triggered performance scan of ${url}`);
+      await audit(ctx, "performance_scan", scanRow.id, "create", `Triggered manual performance scan of ${url}`);
 
       // Enqueue the background scan job.
       const jobLabel = scanJobLabel(assessment.id);
@@ -221,100 +365,25 @@ export function registerObservatoryPerformanceRoutes(app: Express) {
         "other",
         jobLabel,
         async () => {
-          try {
-            const { metrics, findings } = await runPerformanceScan(url.trim(), slaConfig, {
-              timeoutMs: 60_000,
-            });
-
-            // Persist findings to obs_findings.
-            let findingCount = 0;
-            for (const f of findings) {
-              try {
-                const [created] = await db
-                  .insert(obsFindings)
-                  .values({
-                    tenantDomain: ctx.tenantDomain,
-                    assessmentId: assessment.id,
-                    applicationId: assessment.applicationId,
-                    versionId: assessment.versionId,
-                    title: f.title,
-                    description: f.description,
-                    severity: f.severity,
-                    domain: "performance",
-                    status: "open",
-                    recommendation: f.recommendation,
-                    affectedComponent: url.trim(),
-                  })
-                  .returning({ id: obsFindings.id });
-                findingCount++;
-
-                // Emit an audit log entry for each finding.
-                await db.insert(obsAuditLogs).values({
-                  tenantDomain: ctx.tenantDomain,
-                  userId: null,
-                  entityType: "finding",
-                  entityId: created.id,
-                  action: "create",
-                  summary: `Performance scan created finding: ${f.title} (${f.severity})`,
-                }).catch(() => {});
-              } catch (findingErr) {
-                console.error("[perf-scan] Failed to persist finding:", findingErr);
-              }
-            }
-
-            // Store raw metrics as scan_report evidence linked to the assessment.
-            try {
-              const evidenceBody = JSON.stringify({ metrics, findings, slaConfig }, null, 2);
-              const [ev] = await db
-                .insert(obsEvidence)
-                .values({
-                  tenantDomain: ctx.tenantDomain,
-                  title: `Performance Scan Report — ${new Date(metrics.scannedAt).toISOString().slice(0, 10)}`,
-                  description: `Headless browser performance scan of ${url}. ${findingCount} SLA breach(es) found.`,
-                  evidenceType: "scan_report",
-                  source: "headless-browser",
-                  collectedAt: new Date(metrics.scannedAt),
-                })
-                .returning({ id: obsEvidence.id });
-
-              await db
-                .insert(obsAssessmentEvidence)
-                .values({ assessmentId: assessment.id, evidenceId: ev.id })
-                .onConflictDoNothing();
-            } catch (evErr) {
-              console.error("[perf-scan] Failed to persist evidence:", evErr);
-            }
-
-            // Mark scan row completed with metrics.
-            await db
-              .update(obsPerformanceScans)
-              .set({
-                status: "completed",
-                ttfbMs: metrics.ttfbMs ?? null,
-                loadTimeMs: metrics.loadTimeMs ?? null,
-                lcpMs: metrics.lcpMs ?? null,
-                clsScore: metrics.clsScore ?? null,
-                ttiMs: metrics.ttiMs ?? null,
-                findingCount,
-                warnings: (metrics.warnings ?? []) as any,
-                scannedAt: new Date(metrics.scannedAt),
-              })
-              .where(eq(obsPerformanceScans.id, scanRow.id));
-
-            console.log(`[perf-scan] Completed scan for assessment ${assessment.id}: ${findingCount} finding(s)`);
-          } catch (err: any) {
-            console.error(`[perf-scan] Scan failed for assessment ${assessment.id}:`, err);
-            await db
-              .update(obsPerformanceScans)
-              .set({ status: "failed", scanError: err?.message ?? String(err) })
-              .where(eq(obsPerformanceScans.id, scanRow.id))
-              .catch(() => {});
-          }
+          await executePerfScan({
+            tenantDomain: ctx.tenantDomain,
+            assessment: {
+              id: assessment.id,
+              applicationId: assessment.applicationId,
+              versionId: assessment.versionId,
+              title: assessment.title,
+            },
+            scanRow,
+            url: url.trim(),
+            slaConfig,
+            scanSource: "manual",
+            triggeredByUserId: ctx.userId,
+          });
         },
         {
           priority: 3,
           timeoutMs: 120_000,
-          maxRetries: 0,
+          maxRetries: 0, // manual: user can click again
           ctx: { tenantDomain: ctx.tenantDomain, targetId: assessment.id, targetName: assessment.title },
         },
       );
@@ -327,6 +396,45 @@ export function registerObservatoryPerformanceRoutes(app: Express) {
     } catch (err) {
       console.error("[observatory-performance] trigger scan error:", err);
       res.status(500).json({ message: "Failed to start performance scan" });
+    }
+  });
+
+  /**
+   * PUT /api/observatory/assessments/:id/scan-schedule
+   * Set automated scan cadence for a performance assessment.
+   */
+  app.put("/api/observatory/assessments/:id/scan-schedule", async (req, res) => {
+    const ctx = await ctxOr401(req, res);
+    if (!ctx) return;
+    if (!canWrite(ctx)) return res.status(403).json({ message: "Insufficient permissions" });
+
+    try {
+      const parsed = scanScheduleSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ message: "Invalid scan schedule. Must be 'daily', 'weekly', or 'disabled'.", errors: parsed.error.errors });
+      }
+      const { scanSchedule } = parsed.data;
+
+      const [assessment] = await db
+        .select()
+        .from(obsAssessments)
+        .where(and(eq(obsAssessments.id, req.params.id), eq(obsAssessments.tenantDomain, ctx.tenantDomain)));
+      if (!assessment) return res.status(404).json({ message: "Assessment not found" });
+      if (assessment.type !== "performance") {
+        return res.status(400).json({ message: "Scan schedules can only be set on performance assessments." });
+      }
+
+      const [updated] = await db
+        .update(obsAssessments)
+        .set({ scanSchedule, updatedAt: new Date() })
+        .where(and(eq(obsAssessments.id, req.params.id), eq(obsAssessments.tenantDomain, ctx.tenantDomain)))
+        .returning();
+
+      await audit(ctx, "assessment", updated.id, "update", `Set automated scan schedule to '${scanSchedule}'`);
+      res.json({ id: updated.id, scanSchedule: updated.scanSchedule });
+    } catch (err: any) {
+      console.error("[observatory-performance] scan-schedule update error:", err);
+      res.status(500).json({ message: "Failed to update scan schedule" });
     }
   });
 

@@ -16,8 +16,9 @@ import { tickEmailSendWorker } from "./email-campaign-sender";
 import { tickHubspotEmailSyncBackfill } from "./hubspot-email-backfill";
 import { refreshSeoForContext } from "../routes/seo";
 import { db } from "../db";
-import { marketingPlans, seoMetrics, trackedKeywords, collaborationComments, collaborationThreads, annotations, generatedPosts, scheduledJobRuns, type SeoMetric } from "@shared/schema";
-import { eq, and, desc, isNull, lt, sql, inArray } from "drizzle-orm";
+import { marketingPlans, seoMetrics, trackedKeywords, collaborationComments, collaborationThreads, annotations, generatedPosts, scheduledJobRuns, obsAssessments, obsApplications, obsPerformanceScans, type SeoMetric } from "@shared/schema";
+import { eq, and, desc, isNull, lt, sql, inArray, ne } from "drizzle-orm";
+import { isPerfScanDue, runScheduledPerfScan } from "./perf-scan-schedule-core";
 import type { SeoMover } from "./webhook-formatters";
 
 // Cache for market status to avoid repeated DB queries
@@ -1120,6 +1121,7 @@ export async function triggerSeoRefreshNow(): Promise<void> {
 let hubspotSyncInterval: NodeJS.Timeout | null = null;
 let outreachCadenceInterval: NodeJS.Timeout | null = null;
 let collabCleanupInterval: NodeJS.Timeout | null = null;
+let perfScanSchedulerInterval: NodeJS.Timeout | null = null;
 
 /**
  * Sales outreach cadence sweep — advances due cadence steps + reply-floor for
@@ -1322,6 +1324,193 @@ export async function runStaleDraftCleanupJob(): Promise<{ archived: number; pur
   return { archived, purged };
 }
 
+// ---------------------------------------------------------------------------
+// Performance scan scheduler — hourly sweep that triggers automated headless
+// scans for assessments with scan_schedule = 'daily' or 'weekly'.
+// Uses the overdue-check pattern: runs hourly, proceeds only when
+// elapsed >= interval. Stamp-before pattern for lastAutoScanAt.
+// ---------------------------------------------------------------------------
+
+export async function runPerfScanSchedulerJob(): Promise<void> {
+  if (jobStatus.perfScanScheduler?.isRunning) {
+    console.log("[PerfScan Scheduler] Sweep already running, skipping");
+    return;
+  }
+  if (!jobStatus.perfScanScheduler) {
+    jobStatus.perfScanScheduler = { lastRun: null, isRunning: false, nextRun: null, abortController: null };
+  }
+  jobStatus.perfScanScheduler.isRunning = true;
+  console.log("[PerfScan Scheduler] Starting sweep...");
+
+  let total = 0;
+  let queued = 0;
+  let skippedFresh = 0;
+  let skippedNoUrl = 0;
+  let skippedInFlight = 0;
+  let skippedPlan = 0;
+
+  try {
+    // Iterate active tenants with plan gate — same pattern as other sweeps.
+    const tenants = await storage.getAllTenants();
+
+    for (const tenant of tenants) {
+      if (tenant.status !== "active") continue;
+
+      // Plan gate: Observatory feature required.
+      const planGate = await checkFeatureAccessAsync(tenant.plan, "observatory");
+      if (!planGate.allowed) {
+        skippedPlan++;
+        continue;
+      }
+
+      // Find all performance assessments with a non-disabled scan schedule for this tenant.
+      const assessments = await db
+        .select({
+          id: obsAssessments.id,
+          applicationId: obsAssessments.applicationId,
+          versionId: obsAssessments.versionId,
+          title: obsAssessments.title,
+          scanSchedule: obsAssessments.scanSchedule,
+          lastAutoScanAt: obsAssessments.lastAutoScanAt,
+        })
+        .from(obsAssessments)
+        .where(
+          and(
+            eq(obsAssessments.tenantDomain, tenant.domain),
+            eq(obsAssessments.type, "performance"),
+            ne(obsAssessments.scanSchedule, "disabled"),
+          ),
+        );
+
+      const now = Date.now();
+
+      for (const assessment of assessments) {
+        total++;
+
+        const schedule = assessment.scanSchedule as "daily" | "weekly";
+        if (!isPerfScanDue({
+          scanSchedule: schedule,
+          lastAutoScanAt: assessment.lastAutoScanAt,
+          nowMs: now,
+        })) {
+          skippedFresh++;
+          continue;
+        }
+
+        // Skip if a scan (manual or automated) is already in-flight.
+        const { getJobStatusByLabel } = await import("./job-queue");
+        const existing = getJobStatusByLabel(`perf-scan:${assessment.id}`, tenant.domain);
+        if (existing.status === "active" || existing.status === "pending") {
+          skippedInFlight++;
+          continue;
+        }
+
+        // Resolve the application URL.
+        const [appRow] = await db
+          .select()
+          .from(obsApplications)
+          .where(
+            and(
+              eq(obsApplications.id, assessment.applicationId),
+              eq(obsApplications.tenantDomain, tenant.domain),
+            ),
+          );
+        const url = (appRow as any)?.appUrl as string | null;
+        if (!url?.trim()) {
+          skippedNoUrl++;
+          continue;
+        }
+
+        // SSRF guard — skip dangerous URLs rather than crashing the sweep.
+        try {
+          const { assertScanUrlSafe } = await import("./ssrf-guard");
+          await assertScanUrlSafe(url.trim());
+        } catch {
+          skippedNoUrl++;
+          continue;
+        }
+
+        // ── Stamp lastAutoScanAt before enqueuing (stamp-before pattern). ──
+        // This prevents the sweep from re-queuing the same assessment on the
+        // next hourly tick if the scan is still running or if it fails.
+        await db
+          .update(obsAssessments)
+          .set({ lastAutoScanAt: new Date(), updatedAt: new Date() })
+          .where(eq(obsAssessments.id, assessment.id));
+
+        // Resolve SLA config (saved on the application, or platform defaults).
+        const { DEFAULT_PERF_SLA } = await import("./performance-scanner");
+        const savedSla = (appRow as any)?.perfSlaConfig ?? null;
+        const slaConfig = savedSla && typeof savedSla === "object"
+          ? { ...DEFAULT_PERF_SLA, ...savedSla }
+          : DEFAULT_PERF_SLA;
+
+        // Create a "running" scan row immediately.
+        const [scanRow] = await db
+          .insert(obsPerformanceScans)
+          .values({
+            tenantDomain: tenant.domain,
+            assessmentId: assessment.id,
+            applicationId: assessment.applicationId,
+            scanUrl: url.trim(),
+            status: "running",
+            slaConfig,
+            triggeredBy: null, // automated
+            scanSource: "scheduled",
+          })
+          .returning();
+
+        // Enqueue the scan with retries for transient failures.
+        // runScheduledPerfScan awaits the enqueue Promise so telemetry is
+        // only marked completed/failed after the scan actually finishes.
+        const { enqueue } = await import("./job-queue");
+        const { executePerfScan } = await import("../routes/observatory-performance");
+
+        await runScheduledPerfScan(
+          tenant.domain,
+          assessment.id,
+          assessment.title,
+          () => executePerfScan({
+            tenantDomain: tenant.domain,
+            assessment: {
+              id: assessment.id,
+              applicationId: assessment.applicationId,
+              versionId: assessment.versionId,
+              title: assessment.title,
+            },
+            scanRow,
+            url: url.trim(),
+            slaConfig,
+            scanSource: "scheduled",
+            triggeredByUserId: null,
+          }),
+          {
+            startJobRun: trackJobStart,
+            completeJobRun: trackJobComplete,
+            enqueue: (label, work, opts) =>
+              enqueue("other", label, work, {
+                ...opts,
+                ctx: { tenantDomain: tenant.domain, targetId: assessment.id, targetName: assessment.title },
+              }),
+          },
+        );
+
+        queued++;
+        console.log(`[PerfScan Scheduler] Queued ${schedule} scan for "${assessment.title}" (${tenant.domain})`);
+      }
+    }
+  } catch (err) {
+    console.error("[PerfScan Scheduler] Sweep failed:", err);
+  } finally {
+    jobStatus.perfScanScheduler.isRunning = false;
+    jobStatus.perfScanScheduler.lastRun = new Date();
+    console.log(
+      `[PerfScan Scheduler] Sweep complete — total=${total} queued=${queued} ` +
+      `fresh=${skippedFresh} in_flight=${skippedInFlight} no_url=${skippedNoUrl} plan_blocked=${skippedPlan}`,
+    );
+  }
+}
+
 export function startScheduledJobs(): void {
   console.log("[Scheduled Jobs] Initializing scheduled jobs...");
 
@@ -1519,6 +1708,20 @@ export function startScheduledJobs(): void {
 
   // Task #123: Collaboration data hygiene — daily sweep that hard-deletes
   // soft-deleted comments older than 30 days plus orphaned threads.
+  // Performance scan scheduler — hourly sweep, runs when assessment is overdue.
+  if (perfScanSchedulerInterval) clearInterval(perfScanSchedulerInterval);
+  perfScanSchedulerInterval = setInterval(() => {
+    runPerfScanSchedulerJob().catch((err) =>
+      console.error("[PerfScan Scheduler] Interval error:", err?.message || err),
+    );
+  }, 60 * 60 * 1000);
+  // Initial sweep at T+90s — staggered after other startup sweeps.
+  setTimeout(() => {
+    runPerfScanSchedulerJob().catch((err) =>
+      console.error("[PerfScan Scheduler] Initial sweep error:", err?.message || err),
+    );
+  }, 90 * 1000);
+
   if (collabCleanupInterval) clearInterval(collabCleanupInterval);
   collabCleanupInterval = setInterval(() => {
     runCollaborationCleanupJob().catch((err) =>
@@ -1579,6 +1782,10 @@ export function startScheduledJobs(): void {
 }
 
 export function stopScheduledJobs(): void {
+  if (perfScanSchedulerInterval) {
+    clearInterval(perfScanSchedulerInterval);
+    perfScanSchedulerInterval = null;
+  }
   if (trialReminderInterval) {
     clearInterval(trialReminderInterval);
     trialReminderInterval = null;

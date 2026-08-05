@@ -42,6 +42,8 @@ interface Detail {
   scope: string | null;
   outOfScope: string | null;
   applicationId: string;
+  /** Automated scan cadence — only relevant for performance assessments. */
+  scanSchedule: "daily" | "weekly" | "disabled";
   application: { id: string; name: string; appUrl?: string | null; perfSlaConfig?: SlaConfig | null } | null;
   version: { id: string; versionNumber: string } | null;
   findings: { id: string; title: string; severity: string; status: string; domain: string }[];
@@ -397,6 +399,7 @@ export default function ObservatoryAssessmentDetail() {
                 assessmentId={assessment.id}
                 applicationId={assessment.application.id}
                 applicationSlaConfig={assessment.application.perfSlaConfig ?? null}
+                scanSchedule={assessment.scanSchedule ?? "disabled"}
                 canWrite={canWrite}
               />
             </CardContent>

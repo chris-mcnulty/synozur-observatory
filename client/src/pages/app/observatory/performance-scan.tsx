@@ -3,9 +3,11 @@
  * assessment.type === "performance".
  *
  * Shows:
+ *   - Automated scan frequency selector (Daily / Weekly / On-demand)
  *   - Current SLA threshold configuration (editable)
  *   - Trigger-scan button (with in-flight guard)
  *   - Scan history table with measured metrics vs thresholds
+ *     — includes a "Source" column (Manual / Auto) to distinguish runs
  *   - Each completed scan links to findings it created
  */
 import { useState } from "react";
@@ -17,8 +19,15 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Loader2, Play, Settings, CheckCircle2, XCircle, Clock, AlertTriangle } from "lucide-react";
+import { Loader2, Play, Settings, CheckCircle2, XCircle, Clock, AlertTriangle, CalendarClock } from "lucide-react";
 import { formatDate } from "@/lib/utils";
 
 interface PerfScan {
@@ -35,6 +44,7 @@ interface PerfScan {
   warnings: string[];
   scannedAt: string | null;
   createdAt: string;
+  scanSource: "manual" | "scheduled";
 }
 
 interface SlaConfig {
@@ -45,12 +55,20 @@ interface SlaConfig {
   ttiMs: number;
 }
 
+type ScanSchedule = "daily" | "weekly" | "disabled";
+
 const DEFAULT_SLA: SlaConfig = {
   ttfbMs: 800,
   loadTimeMs: 3000,
   lcpMs: 2500,
   clsScore: 0.1,
   ttiMs: 3800,
+};
+
+const SCHEDULE_LABELS: Record<ScanSchedule, string> = {
+  daily: "Daily",
+  weekly: "Weekly",
+  disabled: "On-demand only",
 };
 
 function fmtMs(v: number | null): string {
@@ -89,15 +107,37 @@ function ScanStatusBadge({ status }: { status: PerfScan["status"] }) {
   return <Badge variant="outline" className="bg-blue-500/15 text-blue-400 border-blue-500/30"><Loader2 className="h-3 w-3 mr-1 animate-spin" />Running</Badge>;
 }
 
+function ScanSourceBadge({ source }: { source: "manual" | "scheduled" | undefined }) {
+  if (source === "scheduled")
+    return (
+      <Badge variant="outline" className="bg-purple-600/10 text-purple-400 border-purple-600/25 text-[10px] px-1.5 py-0">
+        <CalendarClock className="h-2.5 w-2.5 mr-0.5" />Auto
+      </Badge>
+    );
+  return (
+    <Badge variant="outline" className="bg-muted text-muted-foreground border-border text-[10px] px-1.5 py-0">
+      Manual
+    </Badge>
+  );
+}
+
 interface Props {
   assessmentId: string;
   applicationId: string;
   /** perfSlaConfig from the application row (may be null → use defaults). */
   applicationSlaConfig?: SlaConfig | null;
+  /** Current automated scan cadence from the assessment row. */
+  scanSchedule: ScanSchedule;
   canWrite: boolean;
 }
 
-export default function PerformanceScanPanel({ assessmentId, applicationId, applicationSlaConfig, canWrite }: Props) {
+export default function PerformanceScanPanel({
+  assessmentId,
+  applicationId,
+  applicationSlaConfig,
+  scanSchedule: initialScanSchedule,
+  canWrite,
+}: Props) {
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const [slaDialogOpen, setSlaDialogOpen] = useState(false);
@@ -138,6 +178,23 @@ export default function PerformanceScanPanel({ assessmentId, applicationId, appl
     onError: (err: Error) => toast({ title: "Scan failed to start", description: err.message, variant: "destructive" }),
   });
 
+  // Set scan schedule
+  const setSchedule = useMutation({
+    mutationFn: async (scanSchedule: ScanSchedule) =>
+      (await apiRequest("PUT", `/api/observatory/assessments/${assessmentId}/scan-schedule`, { scanSchedule })).json(),
+    onSuccess: (_data, scanSchedule) => {
+      invalidate();
+      const label = SCHEDULE_LABELS[scanSchedule];
+      toast({
+        title: "Scan schedule updated",
+        description: scanSchedule === "disabled"
+          ? "Automated scans disabled. Scans will only run when triggered manually."
+          : `Performance scans will now run automatically ${label.toLowerCase()}.`,
+      });
+    },
+    onError: (err: Error) => toast({ title: "Failed to update schedule", description: err.message, variant: "destructive" }),
+  });
+
   // Save SLA config
   const saveSla = useMutation({
     mutationFn: async () => (await apiRequest("PUT", `/api/observatory/applications/${applicationId}/perf-sla`, slaForm)).json(),
@@ -161,7 +218,34 @@ export default function PerformanceScanPanel({ assessmentId, applicationId, appl
             Measures TTFB, Load Time, LCP, CLS, and TTI via headless browser and flags SLA breaches as findings.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* Frequency selector */}
+          {canWrite && (
+            <div className="flex items-center gap-1.5">
+              <CalendarClock className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+              <Select
+                value={initialScanSchedule}
+                onValueChange={(v) => setSchedule.mutate(v as ScanSchedule)}
+                disabled={setSchedule.isPending}
+              >
+                <SelectTrigger className="h-8 text-xs w-36" data-testid="select-scan-schedule">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="disabled" data-testid="schedule-option-disabled">On-demand only</SelectItem>
+                  <SelectItem value="weekly" data-testid="schedule-option-weekly">Weekly</SelectItem>
+                  <SelectItem value="daily" data-testid="schedule-option-daily">Daily</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+          {!canWrite && initialScanSchedule !== "disabled" && (
+            <span className="text-xs text-muted-foreground flex items-center gap-1">
+              <CalendarClock className="h-3.5 w-3.5" />
+              {SCHEDULE_LABELS[initialScanSchedule]}
+            </span>
+          )}
+
           {canWrite && (
             <Button variant="outline" size="sm" onClick={() => { setSlaForm(activeSla); setSlaDialogOpen(true); }} data-testid="button-open-sla-config">
               <Settings className="h-4 w-4 mr-1" /> SLA Thresholds
@@ -184,6 +268,17 @@ export default function PerformanceScanPanel({ assessmentId, applicationId, appl
         </div>
       </div>
 
+      {/* Schedule info banner (when automated schedule is active) */}
+      {initialScanSchedule !== "disabled" && (
+        <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-purple-600/8 border border-purple-600/20 text-xs text-purple-300">
+          <CalendarClock className="h-3.5 w-3.5 shrink-0" />
+          <span>
+            Scans run automatically <strong>{SCHEDULE_LABELS[initialScanSchedule].toLowerCase()}</strong>.
+            Existing open findings with the same rule are not duplicated.
+          </span>
+        </div>
+      )}
+
       {/* SLA summary chips */}
       <div className="flex flex-wrap gap-2 text-xs">
         {[
@@ -203,7 +298,10 @@ export default function PerformanceScanPanel({ assessmentId, applicationId, appl
       {latestCompleted && (
         <Card className="border-border">
           <CardHeader className="pb-2 pt-4 px-4">
-            <CardTitle className="text-sm font-medium">Latest Result — {formatDate(latestCompleted.scannedAt ?? latestCompleted.createdAt)}</CardTitle>
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              Latest Result — {formatDate(latestCompleted.scannedAt ?? latestCompleted.createdAt)}
+              <ScanSourceBadge source={latestCompleted.scanSource} />
+            </CardTitle>
           </CardHeader>
           <CardContent className="px-4 pb-4">
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-sm">
@@ -256,6 +354,7 @@ export default function PerformanceScanPanel({ assessmentId, applicationId, appl
               <thead>
                 <tr className="border-b border-border text-xs text-muted-foreground">
                   <th className="text-left py-2 pr-3 font-normal">Date</th>
+                  <th className="text-left py-2 pr-3 font-normal">Source</th>
                   <th className="text-right py-2 pr-3 font-normal">TTFB</th>
                   <th className="text-right py-2 pr-3 font-normal">Load</th>
                   <th className="text-right py-2 pr-3 font-normal">LCP</th>
@@ -270,6 +369,9 @@ export default function PerformanceScanPanel({ assessmentId, applicationId, appl
                   <tr key={scan.id} className="border-b border-border/50 hover:bg-muted/30 transition-colors" data-testid={`row-perf-scan-${scan.id}`}>
                     <td className="py-2 pr-3 text-muted-foreground whitespace-nowrap">
                       {formatDate(scan.scannedAt ?? scan.createdAt)}
+                    </td>
+                    <td className="py-2 pr-3">
+                      <ScanSourceBadge source={scan.scanSource} />
                     </td>
                     <td className="py-2 pr-3 text-right">
                       <MetricCell value={scan.ttfbMs} threshold={activeSla.ttfbMs} format={fmtMs} />
