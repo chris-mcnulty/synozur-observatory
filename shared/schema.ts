@@ -5151,6 +5151,10 @@ export const obsFindings = pgTable("obs_findings", {
   // built-in security scanner so the scan job can upsert by rule rather than
   // create duplicates on every run.
   scanRuleId: text("scan_rule_id"),
+  // JSON array of page URLs where this violation was found during a multi-page
+  // accessibility scan, e.g. '["https://example.com/","https://example.com/about"]'.
+  // Populated and merged on every automated scan run; null for manual findings.
+  sourcePages: text("source_pages"),
   createdBy: varchar("created_by").references(() => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),

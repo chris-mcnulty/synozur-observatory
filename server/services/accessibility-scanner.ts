@@ -3,27 +3,23 @@
  * axe-core injected into a headless Puppeteer page.
  *
  * Scan flow:
- *  1. Load the application URL with the shared headless browser pool.
- *  2. Inject axe-core and run axe.run() in-page.
- *  3. Map each violation → ScannerFinding (severity, WCAG criterion, selector).
- *  4. Persist findings as obs_findings + link to matching accessibility review items.
- *  5. Store the raw axe report as obs_evidence (evidenceType = "scan_report").
+ *  1. Discover pages via sitemap.xml / nav-link extraction (up to pageLimit).
+ *  2. Scan each discovered page independently with axe-core.
+ *  3. Map each violation → ScannerFinding (severity, WCAG criterion, selector)
+ *     with location.url = the page where the violation was found.
+ *  4. Return a flat ScannerFinding[] across all pages; the scan runner
+ *     deduplicates by scanRuleId|selector and accumulates source_pages.
+ *  5. Raw per-page axe reports are stored as one combined obs_evidence row.
  */
 
 import * as fs from "fs";
 import * as path from "path";
-import { db } from "../db";
-import {
-  obsFindings,
-  obsEvidence,
-  obsAssessmentEvidence,
-  obsFindingEvidence,
-  obsReviewItems,
-  obsReviewItemFindings,
-  obsAuditLogs,
-} from "@shared/schema";
-import { and, eq } from "drizzle-orm";
+import { createRequire } from "module";
 import { runInPage } from "./headless-crawler";
+
+// ESM-compatible require — needed because this module may load as ESM (package.json "type":"module")
+// but axe-core ships as a CJS bundle that must be resolved via the require algorithm.
+const _require = createRequire(import.meta.url);
 import { validateUrlWithDnsCheck } from "../utils/url-validator";
 import type { ScannerProvider, ScanRequest, ScanResult, ScannerFinding } from "./observatory-scanners";
 
@@ -34,7 +30,7 @@ let _axeSource: string | null = null;
 function getAxeSource(): string {
   if (_axeSource) return _axeSource;
   try {
-    const axePath = require.resolve("axe-core");
+    const axePath = _require.resolve("axe-core");
     _axeSource = fs.readFileSync(axePath, "utf8");
     console.log("[AccessibilityScanner] axe-core loaded from:", axePath);
     return _axeSource;
@@ -45,8 +41,7 @@ function getAxeSource(): string {
 
 function getAxeVersion(): string {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return require("axe-core/package.json").version;
+    return (_require("axe-core/package.json") as { version: string }).version;
   } catch {
     return "unknown";
   }
@@ -179,6 +174,267 @@ export async function validateScanTarget(url: string): Promise<string> {
   return result.normalizedUrl ?? url;
 }
 
+// ── SSRF-safe HTTP fetcher ───────────────────────────────────────────────────
+
+const SITEMAP_TIMEOUT_MS = 8_000;
+const MAX_REDIRECT_HOPS  = 5;
+
+/**
+ * Fetch the text body of a URL with full SSRF protection:
+ *  - DNS/IP-validates the URL before connecting (blocks private ranges).
+ *  - Uses `redirect: "manual"` so every Location header is validated before
+ *    following; each hop counts toward MAX_REDIRECT_HOPS.
+ *  - Relative redirect URLs are resolved against the current URL.
+ * Returns the response text on 2xx, or null on any SSRF block, error, or
+ * non-2xx response.
+ */
+export async function safeFetchText(
+  url: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  let current = url;
+  for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
+    // SSRF guard: validate URL (format + DNS → private-IP check) before connecting.
+    const check = await validateUrlWithDnsCheck(current);
+    if (!check.isValid) {
+      console.log(`[AccessibilityScanner] sitemap URL blocked (SSRF): ${current} — ${check.error}`);
+      return null;
+    }
+    current = check.normalizedUrl ?? current;
+
+    // Per-request timeout, combined with any caller cancellation signal.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), SITEMAP_TIMEOUT_MS);
+    if (signal?.aborted) {
+      clearTimeout(timer);
+      ctrl.abort();
+    } else {
+      signal?.addEventListener("abort", () => ctrl.abort(), { once: true });
+    }
+
+    let resp: Response;
+    try {
+      resp = await fetch(current, {
+        signal: ctrl.signal,
+        redirect: "manual",   // follow redirects manually so we can SSRF-check each Location
+        headers: { "User-Agent": "Observatory-AccessibilityScanner/1.0" },
+      });
+    } catch (err: any) {
+      clearTimeout(timer);
+      if (!err?.message?.includes("aborted")) {
+        console.log(`[AccessibilityScanner] sitemap fetch error for ${current}: ${err?.message ?? err}`);
+      }
+      return null;
+    }
+    clearTimeout(timer);
+
+    if (resp.status >= 300 && resp.status < 400) {
+      if (hop === MAX_REDIRECT_HOPS) {
+        console.log(`[AccessibilityScanner] sitemap redirect limit (${MAX_REDIRECT_HOPS}) reached for ${url}`);
+        return null;
+      }
+      const location = resp.headers.get("location");
+      if (!location) {
+        console.log(`[AccessibilityScanner] redirect with no Location header from ${current}`);
+        return null;
+      }
+      try {
+        current = new URL(location, current).toString();
+      } catch {
+        console.log(`[AccessibilityScanner] invalid redirect Location: ${location}`);
+        return null;
+      }
+      continue; // validate + fetch the redirect target
+    }
+
+    if (!resp.ok) return null; // 4xx / 5xx — not a scanner error, just no sitemap
+    return resp.text();
+  }
+  return null; // exhausted hops
+}
+
+// ── Sitemap XML parsing ──────────────────────────────────────────────────────
+
+/**
+ * Extract same-origin page URLs from a regular urlset sitemap XML body.
+ * Skips binary/asset extensions and meta-paths.
+ */
+export function extractLocUrls(
+  xml: string,
+  cap: number,
+  isPageUrl: (url: string) => boolean,
+): string[] {
+  const pages: string[] = [];
+  const locRe = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = locRe.exec(xml)) !== null && pages.length < cap) {
+    const normalized = normalizePageUrl(m[1].trim());
+    if (normalized && isPageUrl(normalized)) pages.push(normalized);
+  }
+  return pages;
+}
+
+/**
+ * Parse page URLs from a sitemap XML string, handling both formats:
+ *  - `<urlset>` — a regular sitemap; `<loc>` entries are page URLs.
+ *  - `<sitemapindex>` — an index sitemap; `<loc>` entries inside `<sitemap>`
+ *    wrappers are child sitemap URLs. Each child is fetched once (SSRF-safe,
+ *    no further recursion) and its page `<loc>` entries collected.
+ *
+ * The page cap is applied across the combined result.
+ */
+export async function parseSitemapPageUrls(
+  xml: string,
+  cap: number,
+  isPageUrl: (url: string) => boolean,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const pages: string[] = [];
+
+  if (/<sitemapindex[\s>]/i.test(xml)) {
+    // Sitemap index: collect child sitemap URLs from <sitemap><loc>…</loc></sitemap>
+    const childRe = /<sitemap[\s>][\s\S]*?<\/sitemap>/gi;
+    const childUrls: string[] = [];
+    let cm: RegExpExecArray | null;
+    while ((cm = childRe.exec(xml)) !== null) {
+      const locM = /<loc>\s*([^<\s]+)\s*<\/loc>/i.exec(cm[0]);
+      if (locM) childUrls.push(locM[1].trim());
+    }
+
+    for (const childUrl of childUrls) {
+      if (pages.length >= cap || signal?.aborted) break;
+      // SSRF-validate each child sitemap URL before fetching
+      const childText = await safeFetchText(childUrl, signal);
+      if (!childText) continue;
+      // Parse child as a plain urlset (one level of recursion only)
+      pages.push(...extractLocUrls(childText, cap - pages.length, isPageUrl));
+    }
+  } else {
+    // Regular urlset
+    pages.push(...extractLocUrls(xml, cap, isPageUrl));
+  }
+
+  return pages;
+}
+
+// ── Page discovery ───────────────────────────────────────────────────────────
+
+/**
+ * Discover pages to scan for a given base URL.
+ *
+ * Strategy (in order):
+ *  1. Fetch <baseOrigin>/sitemap.xml via safeFetchText (SSRF-safe, redirect-
+ *     validated). Parse <loc> entries with one level of sitemap-index recursion.
+ *  2. If sitemap yields fewer than `cap` pages, use `runInPage` on `baseUrl`
+ *     to extract <a href> links from nav/header landmarks (fallback: all links).
+ *  3. Always includes `baseUrl` itself.
+ *  4. Silent fallback: if both methods fail, returns [baseUrl].
+ *
+ * The baseUrl has already been SSRF-validated by the caller.
+ */
+export async function discoverAccessibilityPages(
+  baseUrl: string,
+  cap: number,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const baseOrigin = new URL(baseUrl).origin;
+  const pages = new Set<string>([normalizePageUrl(baseUrl)]);
+
+  /** True if a URL should be included as a page to scan. */
+  function isPageUrl(url: string): boolean {
+    try {
+      const u = new URL(url);
+      if (u.origin !== baseOrigin) return false;
+      const p = u.pathname.toLowerCase();
+      if (/\.(pdf|png|jpg|jpeg|gif|webp|svg|ico|css|js|json|xml|zip|tar|gz|mp4|mp3|ogg|woff|woff2|ttf|eot)(\?|$)/i.test(p)) return false;
+      if (/^\/(sitemap|robots|favicon)/i.test(p)) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // ── 1. Sitemap (SSRF-safe) ────────────────────────────────────────────────
+  try {
+    const sitemapUrl = `${baseOrigin}/sitemap.xml`;
+    const sitemapText = await safeFetchText(sitemapUrl, signal);
+
+    if (sitemapText) {
+      const discovered = await parseSitemapPageUrls(
+        sitemapText, cap - pages.size, isPageUrl, signal,
+      );
+      for (const p of discovered) {
+        if (pages.size >= cap) break;
+        pages.add(p);
+      }
+      console.log(`[AccessibilityScanner] Sitemap yielded ${pages.size} page(s) from ${sitemapUrl}`);
+    }
+  } catch (err: any) {
+    if (!err?.message?.includes("aborted")) {
+      console.log(`[AccessibilityScanner] Sitemap fetch failed (${err?.message ?? err}), will try nav-link extraction`);
+    }
+  }
+
+  // ── 2. Nav-link fallback ──────────────────────────────────────────────────
+  if (pages.size < cap && !signal?.aborted) {
+    try {
+      const navLinks = await runInPage(
+        baseUrl,
+        async (page) => {
+          return await (page as any).evaluate((): string[] => {
+            const hrefs: string[] = [];
+            // Try navigation / header landmarks first
+            const navEls = document.querySelectorAll('nav, header, [role="navigation"]');
+            for (const nav of navEls) {
+              for (const a of nav.querySelectorAll("a[href]")) {
+                const href = (a as HTMLAnchorElement).href;
+                if (href) hrefs.push(href);
+              }
+            }
+            // Fallback: all links on the page
+            if (hrefs.length === 0) {
+              for (const a of document.querySelectorAll("a[href]")) {
+                const href = (a as HTMLAnchorElement).href;
+                if (href) hrefs.push(href);
+              }
+            }
+            return [...new Set(hrefs)];
+          });
+        },
+        { waitTime: 1000, timeout: 20000, ssrfProtect: true, waitUntil: "domcontentloaded", signal },
+      );
+
+      for (const link of navLinks ?? []) {
+        if (pages.size >= cap) break;
+        const normalized = normalizePageUrl(link);
+        if (normalized && isPageUrl(normalized)) {
+          pages.add(normalized);
+        }
+      }
+      console.log(`[AccessibilityScanner] After nav-link extraction: ${pages.size} page(s) discovered`);
+    } catch (err: any) {
+      console.warn(`[AccessibilityScanner] Nav-link extraction failed: ${err?.message ?? err}`);
+    }
+  }
+
+  return [...pages].slice(0, cap);
+}
+
+/** Normalize a URL: strip fragment, trailing slash from non-root paths. */
+function normalizePageUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    u.hash = "";
+    // Canonicalize: keep trailing slash only on root
+    if (u.pathname !== "/" && u.pathname.endsWith("/")) {
+      u.pathname = u.pathname.slice(0, -1);
+    }
+    return u.toString();
+  } catch {
+    return "";
+  }
+}
+
 // ── ScannerProvider implementation ───────────────────────────────────────────
 
 export const axeCoreScanner: ScannerProvider = {
@@ -202,97 +458,125 @@ export const axeCoreScanner: ScannerProvider = {
     // SSRF guard: validate scheme and DNS resolution before passing to headless browser
     const targetUrl = await validateScanTarget(rawUrl);
 
-    const startedAt = new Date();
-    const axeSource = getAxeSource();
-    const findings: (ScannerFinding & { _category: string })[] = [];
-    let rawAxeResults: unknown = null;
-
-    console.log(`[AccessibilityScanner] Scanning ${targetUrl} for assessment ${request.assessmentId}`);
-
-    const scanResult = await runInPage(
-      targetUrl,
-      async (page) => {
-        // Inject axe-core and run WCAG 2.1/2.2 A, AA, AAA
-        await page.evaluate(axeSource);
-
-        return await (page as any).evaluate(async () => {
-          return await (window as any).axe.run(document, {
-            runOnly: {
-              type: "tag",
-              values: ["wcag2a", "wcag2aa", "wcag2aaa", "wcag21a", "wcag21aa", "wcag21aaa", "wcag22aa", "best-practice"],
-            },
-            resultTypes: ["violations", "incomplete"],
-          });
-        });
-      },
-      { waitTime: 1500, timeout: 45000, ssrfProtect: true, waitUntil: "domcontentloaded", signal: request.signal },
+    const pageLimit = Math.min(
+      Math.max(1, Number((request.options as any)?.pageLimit ?? 10)),
+      25,
     );
 
-    if (!scanResult) {
-      throw new Error(`Could not load ${targetUrl} for accessibility scan — headless browser failed`);
+    const startedAt = new Date();
+    const axeSource = getAxeSource();
+    const allFindings: (ScannerFinding & { _category: string })[] = [];
+    const pageReports: Record<string, unknown> = {};
+
+    // ── Page discovery ──────────────────────────────────────────────────────
+    console.log(`[AccessibilityScanner] Discovering pages for ${targetUrl} (cap: ${pageLimit})`);
+    const pages = await discoverAccessibilityPages(targetUrl, pageLimit, request.signal);
+    console.log(`[AccessibilityScanner] Will scan ${pages.length} page(s): ${pages.slice(0, 5).join(", ")}${pages.length > 5 ? ` … (+${pages.length - 5} more)` : ""}`);
+
+    // ── Per-page scan loop ──────────────────────────────────────────────────
+    for (const pageUrl of pages) {
+      if (request.signal?.aborted) break;
+
+      console.log(`[AccessibilityScanner] Scanning ${pageUrl}`);
+
+      const scanResult = await runInPage(
+        pageUrl,
+        async (page) => {
+          await page.evaluate(axeSource);
+          return await (page as any).evaluate(async () => {
+            return await (window as any).axe.run(document, {
+              runOnly: {
+                type: "tag",
+                values: ["wcag2a", "wcag2aa", "wcag2aaa", "wcag21a", "wcag21aa", "wcag21aaa", "wcag22aa", "best-practice"],
+              },
+              resultTypes: ["violations", "incomplete"],
+            });
+          });
+        },
+        { waitTime: 1500, timeout: 45000, ssrfProtect: true, waitUntil: "domcontentloaded", signal: request.signal },
+      );
+
+      if (!scanResult) {
+        console.warn(`[AccessibilityScanner] Could not load ${pageUrl} — emitting target-unreachable`);
+        allFindings.push({
+          ruleId: "target-unreachable",
+          title: "Page could not be loaded",
+          description: `The scanner could not load ${pageUrl}. This may be a transient network error or the page may require authentication.`,
+          severity: "Informational",
+          location: { url: pageUrl },
+          raw: {},
+          _category: "Screen Reader",
+        });
+        continue;
+      }
+
+      pageReports[pageUrl] = scanResult;
+      const axeAny = scanResult as any;
+
+      // Map violations → findings
+      for (const violation of (axeAny.violations ?? [])) {
+        const firstNode = violation.nodes?.[0];
+        const selector = firstNode?.target?.join(", ") ?? "";
+        const htmlSnippet = firstNode?.html ?? "";
+        const nodeCount = violation.nodes?.length ?? 0;
+        const level = extractWcagLevel(violation.tags ?? []);
+        const criterion = extractWcagCriterion(violation.tags ?? []);
+        const category = ruleToCategory(violation.id);
+
+        const description = [
+          violation.description,
+          htmlSnippet ? `\n\nFirst affected element:\n\`${htmlSnippet}\`` : "",
+          nodeCount > 1 ? `\n\n${nodeCount} elements affected on this page.` : "",
+          firstNode?.failureSummary ? `\n\n${firstNode.failureSummary}` : "",
+        ].filter(Boolean).join("");
+
+        allFindings.push({
+          ruleId: violation.id,
+          title: `[${level}] ${violation.help}`,
+          description,
+          severity: mapImpact(violation.impact),
+          wcagCriterion: criterion ? `WCAG ${criterion} (Level ${level})` : undefined,
+          location: { url: pageUrl, selector },
+          raw: { helpUrl: violation.helpUrl, tags: violation.tags, nodeHtml: htmlSnippet },
+          _category: category,
+        });
+      }
+
+      // Surface incomplete (needs-review) items as Informational
+      for (const incomplete of (axeAny.incomplete ?? [])) {
+        const firstNode = incomplete.nodes?.[0];
+        const selector = firstNode?.target?.join(", ") ?? "";
+        const criterion = extractWcagCriterion(incomplete.tags ?? []);
+        const level = extractWcagLevel(incomplete.tags ?? []);
+        const category = ruleToCategory(incomplete.id);
+
+        allFindings.push({
+          ruleId: `${incomplete.id}:needs-review`,
+          title: `Needs review: ${incomplete.help}`,
+          description: `${incomplete.description}\n\nManual verification required.`,
+          severity: "Informational",
+          wcagCriterion: criterion ? `WCAG ${criterion} (Level ${level})` : undefined,
+          location: { url: pageUrl, selector },
+          raw: incomplete,
+          _category: category,
+        });
+      }
+
+      const violations = (axeAny.violations ?? []).length;
+      const incomplete = (axeAny.incomplete ?? []).length;
+      console.log(`[AccessibilityScanner] ${pageUrl} — ${violations} violations, ${incomplete} needs-review`);
     }
 
-    rawAxeResults = scanResult;
-    const axeAny = scanResult as any;
-
-    // Map violations → findings (one per rule, using first node as primary location)
-    for (const violation of (axeAny.violations ?? [])) {
-      const firstNode = violation.nodes?.[0];
-      const selector = firstNode?.target?.join(", ") ?? "";
-      const htmlSnippet = firstNode?.html ?? "";
-      const nodeCount = violation.nodes?.length ?? 0;
-      const level = extractWcagLevel(violation.tags ?? []);
-      const criterion = extractWcagCriterion(violation.tags ?? []);
-      const category = ruleToCategory(violation.id);
-
-      const description = [
-        violation.description,
-        htmlSnippet ? `\n\nFirst affected element:\n\`${htmlSnippet}\`` : "",
-        nodeCount > 1 ? `\n\n${nodeCount} elements affected on this page.` : "",
-        firstNode?.failureSummary ? `\n\n${firstNode.failureSummary}` : "",
-      ].filter(Boolean).join("");
-
-      findings.push({
-        ruleId: violation.id,
-        title: `[${level}] ${violation.help}`,
-        description,
-        severity: mapImpact(violation.impact),
-        wcagCriterion: criterion ? `WCAG ${criterion} (Level ${level})` : undefined,
-        location: { url: targetUrl, selector },
-        raw: { helpUrl: violation.helpUrl, tags: violation.tags, nodeHtml: htmlSnippet },
-        _category: category,
-      });
-    }
-
-    // Surface incomplete (needs-review) items as Informational
-    for (const incomplete of (axeAny.incomplete ?? [])) {
-      const firstNode = incomplete.nodes?.[0];
-      const selector = firstNode?.target?.join(", ") ?? "";
-      const criterion = extractWcagCriterion(incomplete.tags ?? []);
-      const level = extractWcagLevel(incomplete.tags ?? []);
-      const category = ruleToCategory(incomplete.id);
-
-      findings.push({
-        ruleId: `${incomplete.id}:needs-review`,
-        title: `Needs review: ${incomplete.help}`,
-        description: `${incomplete.description}\n\nManual verification required.`,
-        severity: "Informational",
-        wcagCriterion: criterion ? `WCAG ${criterion} (Level ${level})` : undefined,
-        location: { url: targetUrl, selector },
-        raw: incomplete,
-        _category: category,
-      });
-    }
-
-    const violations = (axeAny.violations ?? []).length;
-    const incomplete = (axeAny.incomplete ?? []).length;
-    console.log(`[AccessibilityScanner] ${targetUrl} — ${violations} violations, ${incomplete} needs-review`);
+    const totalViolations = allFindings.filter((f) => f.ruleId !== "target-unreachable" && !f.ruleId.endsWith(":needs-review")).length;
+    console.log(`[AccessibilityScanner] ${pages.length} pages scanned — ${totalViolations} total violation instances (before cross-page dedup in scan runner)`);
 
     return {
-      findings,
+      findings: allFindings,
       rawReport: {
         contentType: "application/json",
-        body: JSON.stringify(rawAxeResults, null, 2),
+        // Store the list of scanned pages alongside the per-page raw reports so
+        // the scan runner can reconstruct scannedPages for the scope-change guard.
+        body: JSON.stringify({ scannedPages: pages, pages: pageReports }, null, 2),
       },
       tool: getAxeVersion(),
       startedAt,
@@ -304,108 +588,3 @@ export const axeCoreScanner: ScannerProvider = {
 // Register in the global registry so runObservatoryScan can find it
 import { registerScanner } from "./observatory-scanners";
 registerScanner(axeCoreScanner);
-
-// ── Persist scan findings + evidence ─────────────────────────────────────────
-
-export async function persistScanFindings(
-  tenantDomain: string,
-  assessmentId: string,
-  applicationId: string,
-  versionId: string | null | undefined,
-  scanResult: ScanResult,
-  scannedUrl: string,
-): Promise<{ created: number; evidenceId: string }> {
-  const now = new Date();
-
-  // 1. Store the raw axe report as obs_evidence, including full JSON body
-  const [evidence] = await db
-    .insert(obsEvidence)
-    .values({
-      tenantDomain,
-      title: `axe-core scan — ${new URL(scannedUrl).hostname} (${now.toISOString().slice(0, 10)})`,
-      description: `Automated WCAG 2.1/2.2 scan via axe-core ${scanResult.tool}. ${scanResult.findings.length} violations found.`,
-      evidenceType: "scan_report",
-      source: `axe-core ${scanResult.tool}`,
-      collectedAt: scanResult.finishedAt,
-      externalUrl: scannedUrl,
-      contentType: scanResult.rawReport?.contentType ?? "application/json",
-      // Persist the raw report payload so analysts can inspect the full axe output
-      body: scanResult.rawReport?.body ?? null,
-    })
-    .returning();
-
-  // Link evidence to assessment
-  await db
-    .insert(obsAssessmentEvidence)
-    .values({ assessmentId, evidenceId: evidence.id })
-    .onConflictDoNothing();
-
-  // 2. Load existing review items so we can link findings to them
-  const reviewItems = await db
-    .select()
-    .from(obsReviewItems)
-    .where(
-      and(
-        eq(obsReviewItems.assessmentId, assessmentId),
-        eq(obsReviewItems.module, "accessibility"),
-      ),
-    );
-  const categoryToItemId = new Map(reviewItems.map((r) => [r.category, r.id]));
-
-  // 3. Deduplicate: skip findings already present (same assessmentId + wcagCriterion + affectedComponent)
-  const existingFindings = await db
-    .select({ wcagCriterion: obsFindings.wcagCriterion, affectedComponent: obsFindings.affectedComponent })
-    .from(obsFindings)
-    .where(eq(obsFindings.assessmentId, assessmentId));
-
-  const existingKeys = new Set(
-    existingFindings.map((f) => `${f.wcagCriterion ?? ""}||${f.affectedComponent ?? ""}`),
-  );
-
-  let created = 0;
-  for (const sf of scanResult.findings) {
-    const extended = sf as ScannerFinding & { _category?: string };
-    const selector = sf.location?.selector ?? "";
-    const dedupeKey = `${sf.wcagCriterion ?? ""}||${selector}`;
-    if (existingKeys.has(dedupeKey)) continue;
-    existingKeys.add(dedupeKey);
-
-    const [finding] = await db
-      .insert(obsFindings)
-      .values({
-        tenantDomain,
-        assessmentId,
-        applicationId,
-        versionId: versionId ?? null,
-        title: sf.title.slice(0, 255),
-        description: sf.description ?? null,
-        severity: sf.severity,
-        domain: "accessibility",
-        status: "open",
-        wcagCriterion: sf.wcagCriterion ?? null,
-        affectedComponent: selector || null,
-        recommendation: `Refer to axe-core guidance: ${(sf.raw as any)?.helpUrl ?? ""}`,
-        createdBy: null,
-      })
-      .returning();
-
-    created++;
-
-    // Link finding to evidence
-    await db
-      .insert(obsFindingEvidence)
-      .values({ findingId: finding.id, evidenceId: evidence.id })
-      .onConflictDoNothing();
-
-    // Link finding to the matching accessibility review item
-    const category = extended._category;
-    if (category && categoryToItemId.has(category)) {
-      await db
-        .insert(obsReviewItemFindings)
-        .values({ reviewItemId: categoryToItemId.get(category)!, findingId: finding.id })
-        .onConflictDoNothing();
-    }
-  }
-
-  return { created, evidenceId: evidence.id };
-}

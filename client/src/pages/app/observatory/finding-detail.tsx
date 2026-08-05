@@ -38,6 +38,8 @@ interface Detail {
   cvssScore: number | null;
   assignedTo: string | null;
   dueDate: string | null;
+  /** JSON array of page URLs where this violation was found (accessibility scan). */
+  sourcePages: string | null;
   application: { id: string; name: string } | null;
   assessment: { id: string; title: string } | null;
   version: { id: string; versionNumber: string } | null;
@@ -227,6 +229,31 @@ export default function ObservatoryFindingDetail() {
               {finding.cvssScore != null && <p><span className="text-muted-foreground">CVSS:</span> {finding.cvssScore}</p>}
               {finding.assignedTo && <p><span className="text-muted-foreground">Assigned to:</span> {finding.assignedTo}</p>}
               {finding.dueDate && <p><span className="text-muted-foreground">Due:</span> {formatDate(finding.dueDate)}</p>}
+              {finding.sourcePages && (() => {
+                let pages: string[] = [];
+                try { pages = JSON.parse(finding.sourcePages); } catch { /* ignore */ }
+                if (!Array.isArray(pages) || pages.length === 0) return null;
+                return (
+                  <div>
+                    <p className="text-xs text-muted-foreground mb-1">Detected on {pages.length} page{pages.length > 1 ? "s" : ""}</p>
+                    <ul className="space-y-0.5">
+                      {pages.map((url) => (
+                        <li key={url} className="truncate">
+                          <a
+                            href={url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs text-primary underline underline-offset-2 hover:text-primary/80"
+                            title={url}
+                          >
+                            {(() => { try { return new URL(url).pathname || "/"; } catch { return url; } })()}
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                );
+              })()}
             </CardContent>
           </Card>
         </div>

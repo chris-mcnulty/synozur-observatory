@@ -5,10 +5,17 @@
  *  1. Look up the assessment + application to get the target URL
  *  2. Find the right ScannerProvider for the assessment type
  *  3. Run the scan (via the job queue — never called inline)
- *  4. Write ScannerFindings → obs_findings (dedup by title + selector within assessment)
- *  5. Persist the raw report as obs_evidence (type: scan_report)
+ *  4. Write ScannerFindings → obs_findings with cross-page dedup:
+ *       dedup key = scanRuleId|selector (no URL component)
+ *       source_pages accumulates ALL page URLs where the violation was seen
+ *  5. Persist the combined raw report as obs_evidence (type: scan_report)
  *  6. Link evidence to assessment + each finding
- *  7. Update assessment status to "completed"
+ *  7. Auto-resolve open scan-created findings no longer detected, with two
+ *     safety guards:
+ *       a) Skip entirely when target-unreachable was detected (global guard)
+ *       b) Skip per-finding when its source_pages contains a URL not in the
+ *          current scanned set (scope-change guard)
+ *  8. Update assessment status to "completed"
  */
 
 import { db } from "../db";
@@ -28,6 +35,7 @@ import {
 import { findScannerForType } from "./observatory-scanners";
 import type { ScanRequest } from "./observatory-scanners";
 import { validateUrlWithDnsCheck } from "../utils/url-validator";
+
 export interface ScanRunOptions {
   assessmentId: string;
   tenantDomain: string;
@@ -35,6 +43,11 @@ export interface ScanRunOptions {
   triggeredByUserId?: string;
   /** Job-queue AbortSignal — passed through to the scanner so it can release resources when the job times out. */
   signal?: AbortSignal;
+  /**
+   * Maximum number of pages to discover and scan (accessibility scans only).
+   * Clamped to [1, 25]. Defaults to 10 inside the scanner.
+   */
+  pageLimit?: number;
 }
 
 export interface ScanRunResult {
@@ -45,7 +58,6 @@ export interface ScanRunResult {
   tool: string;
   durationMs: number;
 }
-
 export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunResult> {
   const { assessmentId, tenantDomain, triggeredByUserId } = opts;
   const started = Date.now();
@@ -121,6 +133,8 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
     applicationId: assessment.applicationId,
     assessmentId,
     target: { url: targetUrl },
+    // Thread pageLimit so the accessibility scanner can cap page discovery.
+    options: opts.pageLimit != null ? { pageLimit: opts.pageLimit } : undefined,
   };
 
   console.log(`[ScanRunner] Starting ${scanner.key} scan for assessment ${assessmentId} (${assessment.type}) → ${targetUrl}`);
@@ -157,7 +171,42 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
     }).onConflictDoNothing();
   }
 
-  // ── 6. Reconcile findings (update existing, insert new, auto-resolve fixed) ──
+  // ── 6. Reconcile findings ─────────────────────────────────────────────────
+
+  // Recover the set of pages actually scanned this run from the raw report.
+  // Used by the scope-change guard when deciding which findings to auto-resolve.
+  const scannedPages = new Set<string>();
+  try {
+    if (result.rawReport?.body) {
+      const reportObj = JSON.parse(result.rawReport.body) as any;
+      if (Array.isArray(reportObj?.scannedPages)) {
+        for (const url of reportObj.scannedPages as string[]) scannedPages.add(url);
+      }
+    }
+  } catch {
+    // non-JSON raw report (e.g. security scanner) — scannedPages stays empty;
+    // the scope-change guard treats empty scannedPages as "all known pages scanned"
+    // via the fallback in allSourcePagesWereScanned (pages.length === 0 → true)
+  }
+  // Fallback: union of finding location URLs (covers scanners that don't embed scannedPages)
+  if (scannedPages.size === 0) {
+    for (const f of result.findings) {
+      if (f.location?.url) scannedPages.add(f.location.url);
+    }
+  }
+
+  // Pre-pass: build ruleKey → Set<pageUrl> across ALL findings (including
+  // duplicates by key from multiple pages).  This lets us record every page
+  // where a violation was seen, even for keys that seenScanKeys will skip.
+  const ruleKeyToPages = new Map<string, Set<string>>();
+  for (const finding of result.findings) {
+    const selector = finding.location?.selector ?? finding.location?.file ?? "";
+    const key = `${finding.ruleId}|${selector}`;
+    if (!ruleKeyToPages.has(key)) ruleKeyToPages.set(key, new Set());
+    const pageUrl = finding.location?.url;
+    if (pageUrl) ruleKeyToPages.get(key)!.add(pageUrl);
+  }
+
   const existingFindings = await db
     .select({
       id: obsFindings.id,
@@ -165,6 +214,7 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
       affectedComponent: obsFindings.affectedComponent,
       status: obsFindings.status,
       scanRuleId: obsFindings.scanRuleId,
+      sourcePages: obsFindings.sourcePages,
     })
     .from(obsFindings)
     .where(and(eq(obsFindings.assessmentId, assessmentId), eq(obsFindings.tenantDomain, tenantDomain)));
@@ -206,23 +256,30 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
   let findingsSkipped = 0;
   let findingsResolved = 0;
 
-  // Scan-side dedup: identical rule|selector results within one scan are processed once.
+  // Scan-side dedup: identical rule|selector results within one scan are
+  // processed (insert/update) once.  The ruleKeyToPages pre-pass above already
+  // captured ALL page URLs for every key, so skipped duplicates still count.
   const seenScanKeys = new Set<string>();
   // "target-unreachable" is a synthetic finding some scanners emit instead of
-  // throwing. Treat it as a failed scan: never auto-resolve other findings.
+  // throwing.  Treat it as a failed scan: never auto-resolve other findings.
   const scanUnreachable = result.findings.some((f) => f.ruleId === "target-unreachable");
 
   for (const finding of result.findings) {
     const selector = finding.location?.selector ?? finding.location?.file ?? "";
     const ruleKey = `${finding.ruleId}|${selector}`;
     if (seenScanKeys.has(ruleKey)) {
-      findingsSkipped++;
+      // Duplicate key from a different page — ruleKeyToPages already recorded
+      // the page URL; skip the insert/update but don't count as skipped.
       continue;
     }
     seenScanKeys.add(ruleKey);
 
     const titleKey = `${finding.title}|${selector}`;
     const existing = existingByRuleKey.get(ruleKey) ?? existingByTitleKey.get(titleKey);
+
+    // All page URLs where this rule|selector violation was seen this run
+    const newPageUrls = [...(ruleKeyToPages.get(ruleKey) ?? new Set<string>())];
+    const sourcePagesJson = newPageUrls.length > 0 ? JSON.stringify(newPageUrls) : null;
 
     let findingId: string;
     if (existing) {
@@ -233,6 +290,12 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
       // remediated / accepted_risk / false_positive / in_progress stay untouched.
       matchedFindingIds.add(existing.id);
       findingId = existing.id;
+
+      // Merge source_pages: union existing + new pages from this run
+      const existingPageUrls = parseSourcePages(existing.sourcePages);
+      const mergedPages = [...new Set([...existingPageUrls, ...newPageUrls])];
+      const mergedSourcePages = mergedPages.length > 0 ? JSON.stringify(mergedPages) : null;
+
       await db
         .update(obsFindings)
         .set({
@@ -242,34 +305,39 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
           cweId: finding.cweId ?? null,
           // Backfill scanRuleId on legacy rows so future scans match by rule.
           scanRuleId: finding.ruleId,
+          // Merge page URLs — additive, never overwrites prior provenance.
+          sourcePages: mergedSourcePages,
           updatedAt: new Date(),
         })
         .where(eq(obsFindings.id, existing.id));
       findingsSkipped++;
     } else {
       const [inserted] = await db
-      .insert(obsFindings)
-      .values({
-        tenantDomain,
-        assessmentId,
-        applicationId: assessment.applicationId,
-        versionId: assessment.versionId ?? null,
-        title: finding.title,
-        description: finding.description ?? null,
-        severity: finding.severity,
-        domain: mapDomain(assessment.type),
-        status: "open",
-        affectedComponent: selector || null,
-        wcagCriterion: finding.wcagCriterion ?? null,
-        cweId: finding.cweId ?? null,
-        sourceLine: finding.location?.line ?? null,
-        scanRuleId: finding.ruleId,
-        stepsToReproduce: finding.location?.url
-          ? `URL: ${finding.location.url}${finding.location.selector ? `\nSelector: ${finding.location.selector}` : ""}`
-          : null,
-        createdBy: triggeredByUserId ?? null,
-      })
-      .returning({ id: obsFindings.id });
+        .insert(obsFindings)
+        .values({
+          tenantDomain,
+          assessmentId,
+          applicationId: assessment.applicationId,
+          versionId: assessment.versionId ?? null,
+          title: finding.title,
+          description: finding.description ?? null,
+          severity: finding.severity,
+          domain: mapDomain(assessment.type),
+          status: "open",
+          affectedComponent: selector || null,
+          wcagCriterion: finding.wcagCriterion ?? null,
+          cweId: finding.cweId ?? null,
+          sourceLine: finding.location?.line ?? null,
+          scanRuleId: finding.ruleId,
+          // Record the first-seen URL in stepsToReproduce for quick analyst reference.
+          stepsToReproduce: finding.location?.url
+            ? `URL: ${finding.location.url}${selector ? `\nSelector: ${selector}` : ""}${newPageUrls.length > 1 ? `\n(+${newPageUrls.length - 1} other page${newPageUrls.length > 2 ? "s" : ""})` : ""}`
+            : null,
+          // Record all pages as a JSON array for programmatic use.
+          sourcePages: sourcePagesJson,
+          createdBy: triggeredByUserId ?? null,
+        })
+        .returning({ id: obsFindings.id });
       findingId = inserted.id;
       findingsCreated++;
     }
@@ -311,12 +379,19 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
 
   // ── 6b. Auto-resolve scan findings no longer detected ──────────────────────
   // Only rows this scanner previously created (scanRuleId set) AND still "open"
-  // are auto-resolved. Human-set statuses and manual findings are never touched.
-  // Skipped entirely when the target was unreachable — a transient outage must
-  // not mass-close real findings.
+  // are candidates. Two safety guards prevent false positives:
+  //   1. Global guard: if any page was unreachable, skip auto-resolve entirely.
+  //   2. Scope-change guard: if a finding's source_pages contains a URL that
+  //      wasn't in the current scan, leave it open — we can't know if it's fixed.
   const staleOpenIds = scanUnreachable ? [] : existingFindings
-    .filter((f) => f.scanRuleId != null && f.status === "open" && !matchedFindingIds.has(f.id))
+    .filter((f) =>
+      f.scanRuleId != null &&
+      f.status === "open" &&
+      !matchedFindingIds.has(f.id) &&
+      allSourcePagesWereScanned(f.sourcePages, scannedPages),
+    )
     .map((f) => f.id);
+
   if (staleOpenIds.length > 0) {
     await db
       .update(obsFindings)
@@ -339,13 +414,12 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
   const durationMs = Date.now() - started;
   console.log(
     `[ScanRunner] Completed ${scanner.key} for ${assessmentId}: ` +
-    `${findingsCreated} findings created, ${findingsSkipped} updated, ${findingsResolved} auto-resolved, ${Math.round(durationMs / 1000)}s`,
+    `${findingsCreated} findings created, ${findingsSkipped} updated/skipped, ${findingsResolved} auto-resolved, ${Math.round(durationMs / 1000)}s`,
   );
 
   return { findingsCreated, findingsSkipped, findingsResolved, evidenceId, tool: result.tool, durationMs };
   }
 }
-
 /** Reasonable default CVSS score when a scan finding has no explicit score. */
 function defaultCvssForSeverity(severity: string): number {
   switch (severity) {
@@ -368,4 +442,31 @@ function mapDomain(assessmentType: string): string {
     case "compliance":           return "compliance";
     default:                     return "other";
   }
+}
+
+/**
+ * Parse source_pages JSON, return the URL array.
+ * Returns [] on null / invalid JSON.
+ */
+function parseSourcePages(sourcePages: string | null | undefined): string[] {
+  if (!sourcePages) return [];
+  try {
+    const parsed = JSON.parse(sourcePages);
+    return Array.isArray(parsed) ? (parsed as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Scope-change guard: return true only if every URL recorded in a finding's
+ * source_pages was actually scanned in the current run.
+ * Findings whose source URL set is entirely within the current scan are safe to
+ * auto-resolve; those with URLs we didn't visit this run are left open.
+ */
+function allSourcePagesWereScanned(sourcePages: string | null | undefined, scannedPages: Set<string>): boolean {
+  const pages = parseSourcePages(sourcePages);
+  // No recorded pages → conservative: allow auto-resolve (legacy row)
+  if (pages.length === 0) return true;
+  return pages.every((url) => scannedPages.has(url));
 }

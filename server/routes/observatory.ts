@@ -1297,16 +1297,27 @@ export function registerObservatoryRoutes(app: Express) {
       return res.status(409).json({ message: "A scan is already queued or running for this assessment.", jobStatus: existing });
     }
 
+    // Optional pageLimit for accessibility scans (1–25, default 10 in scanner)
+    const rawPageLimit = req.body?.pageLimit;
+    let pageLimit: number | undefined;
+    if (rawPageLimit !== undefined && rawPageLimit !== null) {
+      const parsed = Number(rawPageLimit);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 25) {
+        return res.status(400).json({ message: "pageLimit must be an integer between 1 and 25" });
+      }
+      pageLimit = parsed;
+    }
+
     // Enqueue — don't await; the job runs in the background
     enqueueScan(
       scanLabel,
-      async (signal) => runObservatoryScan({ assessmentId, tenantDomain: ctx.tenantDomain, triggeredByUserId: ctx.userId, signal }),
+      async (signal) => runObservatoryScan({ assessmentId, tenantDomain: ctx.tenantDomain, triggeredByUserId: ctx.userId, signal, pageLimit }),
       { ctx: { tenantDomain: ctx.tenantDomain, targetId: assessmentId } },
     ).catch((err) => {
       console.error(`[observatory] scan job failed for ${assessmentId}:`, err);
     });
 
-    await audit(ctx, "assessment", assessmentId, "scan_triggered", `Automated ${assessment.type} scan queued`);
+    await audit(ctx, "assessment", assessmentId, "scan_triggered", `Automated ${assessment.type} scan queued${pageLimit != null ? ` (pageLimit=${pageLimit})` : ""}`);
     res.json({ queued: true, label: scanLabel });
   });
 
