@@ -17,9 +17,13 @@ import * as path from "path";
 import { createRequire } from "module";
 import { runInPage } from "./headless-crawler";
 
-// ESM-compatible require — needed because this module may load as ESM (package.json "type":"module")
-// but axe-core ships as a CJS bundle that must be resolved via the require algorithm.
-const _require = createRequire(import.meta.url);
+// CJS/ESM-compatible require — the production build outputs CJS where import.meta.url
+// is undefined, so prefer __filename (always defined in CJS) and fall back to import.meta.url
+// only when running as ESM (e.g. tsx in development).
+declare const __filename: string | undefined;
+const _require = createRequire(
+  typeof __filename !== "undefined" ? __filename : import.meta.url
+);
 import { validateUrlWithDnsCheck } from "../utils/url-validator";
 import type { ScannerProvider, ScanRequest, ScanResult, ScannerFinding } from "./observatory-scanners";
 
