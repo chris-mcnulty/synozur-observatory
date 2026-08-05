@@ -1,26 +1,9 @@
 import puppeteer, { Browser } from "puppeteer";
-import * as fs from "fs";
+import { findChromiumPath } from "../utils/find-chromium";
 
 let pdfBrowser: Browser | null = null;
 let launching = false;
 let launchQueue: Array<{ resolve: (b: Browser) => void; reject: (e: Error) => void }> = [];
-
-async function findChromiumPath(): Promise<string | undefined> {
-  const possiblePaths = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    "/nix/store/zi4f80l169xlmivz8vja8wlphq74qqk0-chromium-125.0.6422.141/bin/chromium",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-  ].filter(Boolean) as string[];
-
-  for (const execPath of possiblePaths) {
-    try {
-      if (fs.existsSync(execPath)) return execPath;
-    } catch { continue; }
-  }
-  return undefined;
-}
 
 const LAUNCH_ARGS = [
   "--no-sandbox",

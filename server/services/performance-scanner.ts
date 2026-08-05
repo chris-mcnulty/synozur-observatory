@@ -19,6 +19,7 @@ import type { ScannerProvider, ScanRequest, ScanResult, ScannerFinding } from ".
 import puppeteer, { Browser, Page } from "puppeteer";
 import * as fs from "fs";
 import { assertScanUrlSafe, installSsrfRequestInterceptor } from "./ssrf-guard";
+import { findChromiumPath } from "../utils/find-chromium";
 
 // Default thresholds for the ScannerProvider (override via request.options.thresholds).
 const DEFAULT_THRESHOLDS = {
@@ -374,24 +375,7 @@ export async function measurePagePerformance(
   }
 }
 
-async function findChromiumPath(): Promise<string | undefined> {
-  const candidates = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    "/nix/store/zi4f80l169xlmivz8vja8wlphq74qqk0-chromium-125.0.6422.141/bin/chromium",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-  ].filter(Boolean) as string[];
-
-  for (const p of candidates) {
-    try {
-      if (fs.existsSync(p)) return p;
-    } catch {
-      continue;
-    }
-  }
-  return undefined;
-}
+// findChromiumPath is provided by the shared utility; imported at the top of the file.
 
 export async function runPerformanceScan(
   url: string,

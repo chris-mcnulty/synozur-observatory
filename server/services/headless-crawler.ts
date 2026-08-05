@@ -2,6 +2,7 @@ import puppeteer, { Browser, Page } from "puppeteer";
 import * as fs from "fs";
 import * as dns from "dns";
 import { promisify } from "util";
+import { findChromiumPath } from "../utils/find-chromium";
 import { checkIsPrivateIp, checkIsIpAddress } from "../utils/url-validator";
 
 const _dnsResolve4 = promisify(dns.resolve4);
@@ -79,28 +80,6 @@ interface HeadlessCrawlResult {
   renderedContent: string;
 }
 
-// Find system Chromium executable for production deployment
-async function findChromiumPath(): Promise<string | undefined> {
-  const possiblePaths = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    "/nix/store/zi4f80l169xlmivz8vja8wlphq74qqk0-chromium-125.0.6422.141/bin/chromium",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-  ].filter(Boolean) as string[];
-  
-  for (const execPath of possiblePaths) {
-    try {
-      if (fs.existsSync(execPath)) {
-        return execPath;
-      }
-    } catch {
-      continue;
-    }
-  }
-  
-  return undefined;
-}
 
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",

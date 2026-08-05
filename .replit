@@ -30,7 +30,7 @@ externalPort = 3003
 PORT = "5000"
 
 [deployment]
-deploymentTarget = "autoscale"
+deploymentTarget = "vm"
 build = ["npm", "run", "build"]
 run = ["node", "./dist/index.cjs"]
 
