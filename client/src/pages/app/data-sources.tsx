@@ -5,7 +5,6 @@ import {
   Globe,
   Linkedin,
   Instagram,
-  Newspaper,
   RefreshCw,
   TrendingUp,
   TrendingDown,
@@ -44,30 +43,9 @@ interface SocialMetrics {
   status: "connected" | "blocked" | "not_configured";
 }
 
-interface NewsMention {
-  id: string;
-  title: string;
-  source: string;
-  url: string;
-  snippet: string;
-  publishedAt: string;
-  sentiment: "positive" | "neutral" | "negative";
-  relevanceScore: number;
-}
-
-interface NewsResult {
-  competitorId: string;
-  competitorName: string;
-  mentions: NewsMention[];
-  totalMentions: number;
-  status: string;
-  fetchedAt: string;
-}
-
 interface DataSourceSummary {
   websitesTracked: number;
   socialProfiles: number;
-  newsMonitored: number;
   documentsUploaded: number;
   lastCrawl?: string;
 }
@@ -301,39 +279,6 @@ export default function DataSourcesPage() {
     },
   });
 
-  const { data: newsData, isLoading: loadingNews, refetch: refetchNews } = useQuery({
-    queryKey: ["/api/data-sources/news"],
-    queryFn: async () => {
-      const res = await fetch("/api/data-sources/news", { credentials: "include" });
-      if (!res.ok) throw new Error("Failed to fetch news");
-      return res.json();
-    },
-    enabled: competitors.length > 0,
-  });
-
-  const refreshNewsMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch("/api/data-sources/news/refresh", {
-        method: "POST",
-        credentials: "include",
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: "Failed to refresh news" }));
-        throw new Error(err.error || "Failed to refresh news");
-      }
-      return res.json();
-    },
-    onSuccess: (data) => {
-      if (data.results) {
-        setLiveNewsResults(data.results);
-      }
-      toast({ title: "News scan complete", description: `Found ${data.results?.reduce((sum: number, r: any) => sum + (r.mentions?.length || 0), 0) || 0} mentions across your competitors.` });
-    },
-    onError: (error: Error) => {
-      toast({ title: "Error scanning news", description: error.message, variant: "destructive" });
-    },
-  });
-
   const { data: tenantInfo } = useQuery<{ plan: string; features?: any }>({
     queryKey: ["/api/tenant/info"],
     queryFn: async () => {
@@ -421,7 +366,6 @@ export default function DataSourcesPage() {
     const promises: Promise<void>[] = [];
     if (sources.includes("website")) promises.push(refreshAllWebsites());
     if (sources.includes("social")) promises.push(refreshAllSocial());
-    if (sources.includes("news")) promises.push(refreshNewsMutation.mutateAsync().then(() => {}));
     await Promise.all(promises);
   };
 
@@ -440,8 +384,6 @@ export default function DataSourcesPage() {
     if (dates.length === 0) return null;
     return dates.sort((a: string, b: string) => new Date(a).getTime() - new Date(b).getTime())[0];
   })();
-
-  const oldestNews = newsData?.results?.[0]?.fetchedAt || null;
 
   const buildSocialMetrics = (): SocialMetrics[] => {
     const metrics: SocialMetrics[] = [];
@@ -484,21 +426,9 @@ export default function DataSourcesPage() {
   const summary: DataSourceSummary = {
     websitesTracked: (companyProfile ? 1 : 0) + competitors.length,
     socialProfiles: socialMetrics.filter(m => m.status === "connected").length,
-    newsMonitored: competitors.length,
     documentsUploaded: documents.length,
     lastCrawl: competitors[0]?.lastCrawled || companyProfile?.lastCrawled,
   };
-
-  const [liveNewsResults, setLiveNewsResults] = useState<any[]>([]);
-
-  const allMentions: Array<NewsMention & { competitorName: string }> = [];
-  const newsResults = liveNewsResults.length > 0 ? liveNewsResults : (newsData?.results || []);
-  for (const result of newsResults) {
-    for (const mention of result.mentions || []) {
-      allMentions.push({ ...mention, competitorName: result.competitorName });
-    }
-  }
-  allMentions.sort((a, b) => b.relevanceScore - a.relevanceScore);
 
   return (
     <AppLayout>
@@ -519,7 +449,6 @@ export default function DataSourcesPage() {
           mode="global"
           websiteLastUpdated={oldestWebsite}
           socialLastUpdated={oldestSocial}
-          newsLastUpdated={oldestNews}
           autoRefreshAllowed={autoRefreshAllowed}
           tenantPlan={tenantInfo?.plan}
           onRefresh={handleFreshnessBarRefresh}
@@ -568,26 +497,6 @@ export default function DataSourcesPage() {
           </Card>
           <Card>
             <CardContent className="pt-6">
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
-                  <div className="p-2 rounded-lg bg-orange-500/10">
-                    <Newspaper className="w-5 h-5 text-orange-500" />
-                  </div>
-                  <div>
-                    <p className="text-2xl font-bold">{allMentions.length}</p>
-                    <p className="text-sm text-muted-foreground">News Mentions</p>
-                  </div>
-                </div>
-                <StalenessDot 
-                  lastUpdated={newsData?.results?.[0]?.fetchedAt} 
-                  label="News data freshness"
-                  size="md"
-                />
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent className="pt-6">
               <div className="flex items-center gap-3">
                 <div className="p-2 rounded-lg bg-green-500/10">
                   <FileText className="w-5 h-5 text-green-500" />
@@ -605,77 +514,11 @@ export default function DataSourcesPage() {
           <TabsList>
             <TabsTrigger value="overview" data-testid="tab-overview">Overview</TabsTrigger>
             <TabsTrigger value="social" data-testid="tab-social">Social Media</TabsTrigger>
-            <TabsTrigger value="news" data-testid="tab-news">News Mentions</TabsTrigger>
             <TabsTrigger value="websites" data-testid="tab-websites">Websites</TabsTrigger>
           </TabsList>
 
           <TabsContent value="overview" className="mt-6 space-y-6">
             <div className="grid gap-6 md:grid-cols-2">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2">
-                    <Rss className="w-5 h-5" />
-                    Latest News Mentions
-                  </CardTitle>
-                  <CardDescription>Recent mentions of your competitors in the news</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  {loadingNews ? (
-                    <div className="space-y-3">
-                      {[1, 2, 3].map(i => (
-                        <Skeleton key={i} className="h-16 w-full" />
-                      ))}
-                    </div>
-                  ) : allMentions.length > 0 ? (
-                    <div className="space-y-3">
-                      {allMentions.slice(0, 5).map((mention) => (
-                        <div
-                          key={mention.id}
-                          className="flex items-start gap-3 p-3 rounded-lg bg-card/50 border border-border/50"
-                        >
-                          {getSentimentIcon(mention.sentiment)}
-                          <div className="flex-1 min-w-0">
-                            <a
-                              href={mention.url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="font-medium text-sm hover:text-primary transition-colors line-clamp-1"
-                            >
-                              {mention.title}
-                            </a>
-                            <p className="text-xs text-muted-foreground mt-1 line-clamp-2">
-                              {mention.snippet}
-                            </p>
-                            <div className="flex items-center gap-2 mt-2">
-                              <Badge variant="outline" className="text-xs">
-                                {mention.competitorName}
-                              </Badge>
-                              <span className="text-xs text-muted-foreground">{mention.source}</span>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="text-center py-8 text-muted-foreground">
-                      <Newspaper className="w-12 h-12 mx-auto mb-3 opacity-50" />
-                      <p className="font-medium">No news mentions yet</p>
-                      <p className="text-xs mt-1 max-w-xs mx-auto">Scan the web for recent mentions of your competitors in news articles and blogs.</p>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="mt-4"
-                        onClick={() => refreshNewsMutation.mutate()}
-                        disabled={refreshNewsMutation.isPending}
-                      >
-                        <RefreshCw className={`w-4 h-4 mr-2 ${refreshNewsMutation.isPending ? "animate-spin" : ""}`} />
-                        {refreshNewsMutation.isPending ? "Scanning..." : "Scan for mentions"}
-                      </Button>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-
               <Card>
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
@@ -823,96 +666,6 @@ export default function DataSourcesPage() {
                         <p className="text-xs mt-2">Add competitors to track their social media presence</p>
                       </div>
                     )}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          <TabsContent value="news" className="mt-6">
-            <Card>
-              <CardHeader className="flex flex-row items-center justify-between">
-                <div>
-                  <CardTitle>News Mentions</CardTitle>
-                  <CardDescription>Track competitor mentions in news and articles</CardDescription>
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => refreshNewsMutation.mutate()}
-                  disabled={refreshNewsMutation.isPending}
-                >
-                  <RefreshCw className={`w-4 h-4 mr-2 ${refreshNewsMutation.isPending ? "animate-spin" : ""}`} />
-                  Refresh
-                </Button>
-              </CardHeader>
-              <CardContent>
-                {loadingNews ? (
-                  <div className="space-y-4">
-                    {[1, 2, 3, 4, 5].map(i => (
-                      <Skeleton key={i} className="h-20 w-full" />
-                    ))}
-                  </div>
-                ) : allMentions.length > 0 ? (
-                  <div className="space-y-4">
-                    {allMentions.map((mention) => (
-                      <div
-                        key={mention.id}
-                        className="p-4 rounded-lg border border-border/50 bg-card/50"
-                      >
-                        <div className="flex items-start justify-between gap-4">
-                          <div className="flex-1">
-                            <div className="flex items-center gap-2 mb-2">
-                              {getSentimentIcon(mention.sentiment)}
-                              <a
-                                href={mention.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="font-medium hover:text-primary transition-colors"
-                              >
-                                {mention.title}
-                              </a>
-                            </div>
-                            <p className="text-sm text-muted-foreground line-clamp-2 mb-3">
-                              {mention.snippet}
-                            </p>
-                            <div className="flex items-center gap-3 flex-wrap">
-                              <Badge variant="outline">{mention.competitorName}</Badge>
-                              <span className="text-xs text-muted-foreground">{mention.source}</span>
-                              <Badge variant="outline" className={getSentimentBadgeColor(mention.sentiment)}>
-                                {mention.sentiment}
-                              </Badge>
-                              <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                                <span>Relevance:</span>
-                                <Progress value={mention.relevanceScore} className="w-16 h-1.5" />
-                                <span>{mention.relevanceScore}%</span>
-                              </div>
-                            </div>
-                          </div>
-                          <Button variant="ghost" size="icon" asChild>
-                            <a href={mention.url} target="_blank" rel="noopener noreferrer">
-                              <ExternalLink className="w-4 h-4" />
-                            </a>
-                          </Button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="text-center py-12 text-muted-foreground">
-                    <Newspaper className="w-12 h-12 mx-auto mb-3 opacity-50" />
-                    <p className="font-medium">No news mentions yet</p>
-                    <p className="text-sm mt-2 mb-4 max-w-md mx-auto">
-                      News scanning searches the web for recent articles, press releases, and blog posts mentioning your competitors. Results are fetched on-demand and analyzed for sentiment.
-                    </p>
-                    <Button
-                      variant="outline"
-                      onClick={() => refreshNewsMutation.mutate()}
-                      disabled={refreshNewsMutation.isPending}
-                    >
-                      <RefreshCw className={`w-4 h-4 mr-2 ${refreshNewsMutation.isPending ? "animate-spin" : ""}`} />
-                      {refreshNewsMutation.isPending ? "Scanning the web..." : "Scan for mentions"}
-                    </Button>
                   </div>
                 )}
               </CardContent>

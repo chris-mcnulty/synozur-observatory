@@ -1,7 +1,6 @@
 import { storage, type ContextFilter } from "../storage";
 import Anthropic from "@anthropic-ai/sdk";
 import type { Activity, Competitor, CompanyProfile, IntelligenceBriefing } from "@shared/schema";
-import { fetchCompetitorNews, buildNewsSummary, type NewsArticle } from "./news-service";
 import { buildCompetitorDocumentContextForCompetitors } from "./competitor-document-context";
 
 const anthropic = new Anthropic({
@@ -38,6 +37,7 @@ export interface RiskAlert {
   source: string;
 }
 
+/** @deprecated kept for schema compatibility — no longer populated */
 export interface NewsArticleBrief {
   title: string;
   description: string;
@@ -221,20 +221,11 @@ export async function generateBriefing(
     ]);
   }
 
-  let newsArticles: NewsArticle[] = [];
-  try {
-    newsArticles = await fetchCompetitorNews(competitors, baseline || undefined, periodDays);
-    console.log(`[Intelligence Briefing] Fetched ${newsArticles.length} news articles for ${competitors.length} competitors`);
-  } catch (error: any) {
-    console.error("[Intelligence Briefing] News fetch failed, continuing without news:", error.message);
-  }
-
   const uniqueCompetitorIds = new Set(
     activities.filter(a => a.competitorId).map(a => a.competitorId)
   );
 
   const signalSummary = buildSignalSummary(activities);
-  const newsSummary = buildNewsSummary(newsArticles);
   const competitorContext = buildCompetitorContext(competitors, baseline || undefined);
   const noCompetitorsTracked = competitors.length === 0;
 
@@ -260,10 +251,9 @@ ${competitorDocsSection}
 
 ## SIGNALS DETECTED (${activities.length} total over the past ${periodDays} days):
 ${signalSummary}
-${newsSummary}
 
-${activities.length === 0 && newsArticles.length === 0 ? `
-Note: No signals or news were detected this period. This could mean competitors are stable, or monitoring coverage needs expansion. Provide a briefing that acknowledges the quiet period and suggests what to watch for based on the competitive landscape.
+${activities.length === 0 ? `
+Note: No signals were detected this period. This could mean competitors are stable, or monitoring coverage needs expansion. Provide a briefing that acknowledges the quiet period and suggests what to watch for based on the competitive landscape.
 ` : ""}
 
 ${noCompetitorsTracked ? `
@@ -358,15 +348,6 @@ Rules:
       byImpact[act.impact || "Low"] = (byImpact[act.impact || "Low"] || 0) + 1;
     }
 
-    const newsForStorage: NewsArticleBrief[] = newsArticles.map(a => ({
-      title: a.title,
-      description: a.description,
-      url: a.url,
-      source: a.source,
-      publishedAt: a.publishedAt,
-      matchedEntity: a.matchedEntity,
-    }));
-
     const { movements, themes } = stripBaselineFromBriefing(parsed, baseline?.companyName);
 
     const filteredMovements = movements.filter(
@@ -413,7 +394,7 @@ Rules:
         byImpact,
         highlights: parsed.signalDigest?.highlights || [],
       },
-      newsArticles: newsForStorage,
+      newsArticles: [],
       periodLabel,
       generatedAt: now.toISOString(),
     };
@@ -445,14 +426,7 @@ Rules:
         byImpact,
         highlights: [],
       },
-      newsArticles: newsArticles.map(a => ({
-        title: a.title,
-        description: a.description,
-        url: a.url,
-        source: a.source,
-        publishedAt: a.publishedAt,
-        matchedEntity: a.matchedEntity,
-      })),
+      newsArticles: [],
       periodLabel,
       generatedAt: now.toISOString(),
     };
@@ -590,7 +564,6 @@ export async function autoPushBriefingToHubspot(opts: {
 export type BriefingPhase =
   | "queued"
   | "loading_signals"
-  | "fetching_news"
   | "synthesising"
   | "finalising"
   | "complete";
@@ -606,7 +579,6 @@ export type BriefingProgressReporter = (progress: BriefingProgress) => void;
 const PHASE_LABELS: Record<BriefingPhase, string> = {
   queued: "Queued",
   loading_signals: "Loading recent signals",
-  fetching_news: "Fetching market news",
   synthesising: "Synthesising sections",
   finalising: "Finalising briefing",
   complete: "Complete",
@@ -615,7 +587,6 @@ const PHASE_LABELS: Record<BriefingPhase, string> = {
 const PHASE_PERCENT: Record<BriefingPhase, number> = {
   queued: 2,
   loading_signals: 10,
-  fetching_news: 25,
   synthesising: 60,
   finalising: 92,
   complete: 100,
@@ -670,22 +641,13 @@ export async function generateBriefingData(
     ]);
   }
 
-  reportPhase("fetching_news");
-
-  let newsArticles: NewsArticle[] = [];
-  try {
-    newsArticles = await fetchCompetitorNews(competitors, baseline || undefined, periodDays);
-    console.log(`[Intelligence Briefing] Fetched ${newsArticles.length} news articles for ${competitors.length} competitors`);
-  } catch (error: any) {
-    console.error("[Intelligence Briefing] News fetch failed, continuing without news:", error.message);
-  }
+  reportPhase("synthesising");
 
   const uniqueCompetitorIds = new Set(
     activities.filter(a => a.competitorId).map(a => a.competitorId)
   );
 
   const signalSummary = buildSignalSummary(activities);
-  const newsSummary = buildNewsSummary(newsArticles);
   const competitorContext = buildCompetitorContext(competitors, baseline || undefined);
   const noCompetitorsTracked = competitors.length === 0;
 
@@ -711,10 +673,9 @@ ${competitorDocsSection}
 
 ## SIGNALS DETECTED (${activities.length} total over the past ${periodDays} days):
 ${signalSummary}
-${newsSummary}
 
-${activities.length === 0 && newsArticles.length === 0 ? `
-Note: No signals or news were detected this period. This could mean competitors are stable, or monitoring coverage needs expansion. Provide a briefing that acknowledges the quiet period and suggests what to watch for based on the competitive landscape.
+${activities.length === 0 ? `
+Note: No signals were detected this period. This could mean competitors are stable, or monitoring coverage needs expansion. Provide a briefing that acknowledges the quiet period and suggests what to watch for based on the competitive landscape.
 ` : ""}
 
 ${noCompetitorsTracked ? `
@@ -812,15 +773,6 @@ Rules:
       byImpact[act.impact || "Low"] = (byImpact[act.impact || "Low"] || 0) + 1;
     }
 
-    const newsForStorage: NewsArticleBrief[] = newsArticles.map(a => ({
-      title: a.title,
-      description: a.description,
-      url: a.url,
-      source: a.source,
-      publishedAt: a.publishedAt,
-      matchedEntity: a.matchedEntity,
-    }));
-
     const rawMovements = Array.isArray(parsed.competitorMovements) ? parsed.competitorMovements : [];
     const rawThemes = Array.isArray(parsed.keyThemes) ? parsed.keyThemes : [];
     const rawActionItems = Array.isArray(parsed.actionItems) ? parsed.actionItems : [];
@@ -847,7 +799,7 @@ Rules:
         byImpact,
         highlights: parsed.signalDigest?.highlights || [],
       },
-      newsArticles: newsForStorage,
+      newsArticles: [],
       periodLabel,
       generatedAt: now.toISOString(),
     };

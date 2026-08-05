@@ -5,8 +5,6 @@
 - [Unified Marketing Calendar](unified-marketing-calendar.md) — aggregates social/email/content; social scoped tenant-only (no marketId), emails+briefs tenant+market; lifecycle derived; gated on editorialCalendar feature.
 - [LinkedIn global app + posting gate](linkedin-global-app.md) — LinkedIn uses one Synozur-owned OAuth app (env vars, not per-tenant); direct posting gated by LINKEDIN_DIRECT_PUBLISH_ENABLED until LinkedIn approves.
 - [Global social OAuth apps (no per-tenant)](global-social-oauth-apps.md) — X/Facebook/Instagram now use ONE shared Synozur app each (global_platform_credentials table, Global Admin UI), not per-tenant; tenants connect one-click; per-tenant credentials retired.
-- [GNews ideation scan relevance](gnews-scan-relevance.md) — ideation/founding-signals news scan must phrase-quote + sortby=relevance + in=title,description; competitor path keeps publishedAt recency.
-- [Competitor News Mentions data source](competitor-news-source.md) — News Mentions tab now uses GNews (was DuckDuckGo scraping); no site: operator, scans all competitors via worker pool + deadline (sync endpoint).
 - [No error boundary + dark theme = black screen](no-error-boundary-black-screen.md) — uncaught render errors blank the dark app body; global ErrorBoundary now logs the real error + offers recovery. "Black screen" ≠ data loss.
 - [Campaign & Theme Planning Hub](planning-hub.md) — per-campaign/theme aggregation of posts/emails/briefs via existing assoc columns; manual content reuses "Marketing Calendar (manual)" so it shows in calendar too.
 - [Editorial brief → draft flow](editorial-brief-draft-flow.md) — campaign/theme live on the brief; category lives on the draft (content asset) so it's only assignable after drafting.

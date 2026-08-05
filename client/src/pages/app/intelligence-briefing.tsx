@@ -108,15 +108,6 @@ interface RiskAlert {
   source: string;
 }
 
-interface NewsArticleBrief {
-  title: string;
-  description: string;
-  url: string;
-  source: string;
-  publishedAt: string;
-  matchedEntity: string;
-}
-
 interface BriefingProgress {
   phase: string;
   phaseLabel: string;
@@ -135,7 +126,7 @@ interface BriefingData {
     byImpact: Record<string, number>;
     highlights: string[];
   };
-  newsArticles?: NewsArticleBrief[];
+  newsArticles?: unknown[];
   periodLabel: string;
   generatedAt: string;
   progress?: BriefingProgress;
@@ -1521,59 +1512,6 @@ export default function IntelligenceBriefingPage() {
                       </Card>
                     );
                   })}
-                </div>
-              </div>
-            )}
-
-            {bd.newsArticles && bd.newsArticles.length > 0 && (
-              <div>
-                <h2 className="text-lg font-semibold mb-3 flex items-center gap-2">
-                  <Newspaper className="w-5 h-5 text-primary" />
-                  News & Press Coverage
-                  <Badge variant="secondary" className="text-[10px]">{bd.newsArticles.length} articles</Badge>
-                </h2>
-                <div className="space-y-2">
-                  {(() => {
-                    const byEntity: Record<string, typeof bd.newsArticles> = {};
-                    for (const article of bd.newsArticles!) {
-                      if (!byEntity[article.matchedEntity]) byEntity[article.matchedEntity] = [];
-                      byEntity[article.matchedEntity]!.push(article);
-                    }
-                    return Object.entries(byEntity).map(([entity, articles]) => (
-                      <Card key={entity} data-testid={`card-news-${entity.replace(/\s+/g, "-").toLowerCase()}`}>
-                        <CardContent className="pt-4 pb-4 px-4">
-                          <h3 className="text-sm font-semibold mb-2">{entity}</h3>
-                          <div className="space-y-2">
-                            {articles!.map((article, ai) => (
-                              <div key={ai} className="flex items-start gap-2 text-xs">
-                                <ChevronRight className="w-3 h-3 mt-0.5 shrink-0 text-primary/50" />
-                                <div className="flex-1 min-w-0">
-                                  <a
-                                    href={article.url.startsWith("http://") || article.url.startsWith("https://") ? article.url : "#"}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="text-sm font-medium text-foreground hover:text-primary transition-colors inline-flex items-center gap-1"
-                                    data-testid={`link-news-${ai}`}
-                                  >
-                                    {article.title}
-                                    <ExternalLink className="w-3 h-3 shrink-0" />
-                                  </a>
-                                  <div className="flex items-center gap-2 mt-0.5 text-muted-foreground">
-                                    <span>{article.source}</span>
-                                    <span>·</span>
-                                    <span>{new Date(article.publishedAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span>
-                                  </div>
-                                  {article.description && (
-                                    <p className="text-muted-foreground mt-1 line-clamp-2">{article.description}</p>
-                                  )}
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        </CardContent>
-                      </Card>
-                    ));
-                  })()}
                 </div>
               </div>
             )}

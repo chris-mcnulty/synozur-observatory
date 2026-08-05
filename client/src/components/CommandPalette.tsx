@@ -133,16 +133,6 @@ export default function CommandPalette({ open, onOpenChange }: CommandPalettePro
     enabled: open,
   });
 
-  const { data: newsData } = useQuery({
-    queryKey: ["commandPalette", "/api/data-sources/news"],
-    queryFn: async () => {
-      const res = await fetch("/api/data-sources/news", { credentials: "include" });
-      if (!res.ok) return null;
-      return res.json();
-    },
-    enabled: open,
-  });
-
   // Products, documents, battle cards, and campaigns for global content search.
   // Fetched only when the palette is open to avoid unnecessary load.
   // Namespaced query keys prevent cache collisions with other consumers.
@@ -360,23 +350,6 @@ export default function CommandPalette({ open, onOpenChange }: CommandPalettePro
   const refreshActions: CommandAction[] = useMemo(() => {
     const actions: CommandAction[] = [];
 
-    if (newsData) {
-      const newsLastFetched = newsData.results?.[0]?.fetchedAt;
-      const staleness = getFullStalenessInfo(newsLastFetched);
-      actions.push({
-        id: "refresh-news",
-        label: "Refresh News Mentions",
-        description: `Last updated: ${staleness.timeAgo}`,
-        icon: <Newspaper className="w-4 h-4" />,
-        category: "Refresh",
-        action: () => {
-          fetch("/api/data-sources/news/refresh", { method: "POST", credentials: "include" });
-          trackAction("refresh-news");
-          onOpenChange(false);
-        },
-      });
-    }
-
     if (companyProfile) {
       const staleness = getFullStalenessInfo(companyProfile.lastCrawl);
       actions.push({
@@ -411,7 +384,7 @@ export default function CommandPalette({ open, onOpenChange }: CommandPalettePro
     });
 
     return actions;
-  }, [newsData, companyProfile, competitors, trackAction, onOpenChange]);
+  }, [companyProfile, competitors, trackAction, onOpenChange]);
 
   // -- Recent activity entries --
   const recentActivityActions: CommandAction[] = useMemo(() =>

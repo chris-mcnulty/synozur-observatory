@@ -3,13 +3,12 @@
  *
  * Combines the company's strategic grounding (with uploaded MPF/GTM taking
  * precedence over generated), the most recent intelligence-report indicators +
- * action items, and an on-demand news scan of user-named subjects/companies
+ * action items
  * into several candidate campaign ideas the user can adopt or bypass.
  */
 
 import { storage } from "../storage";
 import { loadStrategicContext, formatStrategicContextForPrompt } from "./strategic-context";
-import { scanNewsForSubjects, type SubjectNews } from "./news-service";
 import { completeForFeature } from "./ai-provider";
 import {
   buildIdeationPrompt,
@@ -29,7 +28,6 @@ export interface IdeateParams {
 
 export interface IdeateResult {
   ideas: CampaignIdea[];
-  news: SubjectNews[];
   intelAsOf: string | null;
   usage: { inputTokens: number; outputTokens: number };
   model: string;
@@ -100,16 +98,12 @@ export async function ideateCampaigns(params: IdeateParams): Promise<IdeateResul
   );
   const strategicBlock = formatStrategicContextForPrompt(strategicCtx);
 
-  const [{ block: intelBlock, asOf }, news] = await Promise.all([
-    loadIntelIndicators(params.tenantDomain, params.marketId),
-    scanNewsForSubjects(params.subjects ?? [], undefined, undefined, params.message),
-  ]);
+  const { block: intelBlock, asOf } = await loadIntelIndicators(params.tenantDomain, params.marketId);
 
   const prompt = buildIdeationPrompt({
     message: params.message,
     strategicBlock,
     intelBlock,
-    news,
     count,
   });
 
@@ -121,7 +115,6 @@ export async function ideateCampaigns(params: IdeateParams): Promise<IdeateResul
 
   return {
     ideas: parseCampaignIdeas(result.text),
-    news,
     intelAsOf: asOf,
     usage: { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens },
     model: result.model,

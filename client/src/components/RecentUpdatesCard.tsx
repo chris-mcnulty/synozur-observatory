@@ -5,7 +5,6 @@ import { Separator } from "@/components/ui/separator";
 import { useQuery } from "@tanstack/react-query";
 import {
   Globe,
-  Newspaper,
   ExternalLink,
   ChevronRight,
   Loader2,
@@ -25,24 +24,6 @@ interface ActivityItem {
   competitorName?: string;
   createdAt: string;
   details?: any;
-}
-
-interface NewsArticle {
-  title: string;
-  description: string;
-  url: string;
-  source: string;
-  publishedAt: string;
-  matchedEntity: string;
-}
-
-interface BriefingData {
-  newsArticles?: NewsArticle[];
-}
-
-interface IntelligenceBriefing {
-  id: string;
-  briefingData: BriefingData;
 }
 
 const impactConfig: Record<string, { color: string }> = {
@@ -98,25 +79,12 @@ export default function RecentUpdatesCard({ entityType, entityId, entityName }: 
     enabled: !!entityId,
   });
 
-  const { data: latestBriefing } = useQuery<IntelligenceBriefing | null>({
-    queryKey: ["/api/intelligence-briefings/latest"],
-    queryFn: async () => {
-      const res = await fetch("/api/intelligence-briefings/latest", { credentials: "include" });
-      if (!res.ok) return null;
-      return res.json();
-    },
-  });
-
-  const newsArticles = (latestBriefing?.briefingData?.newsArticles || [])
-    .filter(a => a.matchedEntity.toLowerCase() === entityName.toLowerCase())
-    .slice(0, 5);
-
   const meaningfulActivities = activities.filter(
     a => a.type !== "crawl_completed"
   );
 
   const isLoading = loadingActivity;
-  const hasContent = meaningfulActivities.length > 0 || newsArticles.length > 0;
+  const hasContent = meaningfulActivities.length > 0;
 
   return (
     <Card data-testid={`card-recent-updates-${entityType}`}>
@@ -125,7 +93,7 @@ export default function RecentUpdatesCard({ entityType, entityId, entityName }: 
           <Activity className="w-4 h-4" />
           Recent Updates
         </CardTitle>
-        <CardDescription>Latest monitoring signals & news</CardDescription>
+        <CardDescription>Latest monitoring signals</CardDescription>
       </CardHeader>
       <CardContent>
         {isLoading && (
@@ -188,39 +156,6 @@ export default function RecentUpdatesCard({ entityType, entityId, entityName }: 
                       </div>
                     );
                   })}
-                </div>
-              </div>
-            )}
-
-            {newsArticles.length > 0 && meaningfulActivities.length > 0 && (
-              <Separator />
-            )}
-
-            {newsArticles.length > 0 && (
-              <div>
-                <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1.5">
-                  <Newspaper className="w-3 h-3" />
-                  News Coverage
-                </p>
-                <div className="space-y-2">
-                  {newsArticles.map((article, i) => (
-                    <div key={i} data-testid={`update-news-${i}`}>
-                      <a
-                        href={article.url.startsWith("http://") || article.url.startsWith("https://") ? article.url : "#"}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-xs font-medium text-foreground hover:text-primary transition-colors inline-flex items-start gap-1"
-                      >
-                        <span className="line-clamp-2">{article.title}</span>
-                        <ExternalLink className="w-3 h-3 shrink-0 mt-0.5" />
-                      </a>
-                      <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground mt-0.5">
-                        <span>{article.source}</span>
-                        <span>·</span>
-                        <span>{new Date(article.publishedAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span>
-                      </div>
-                    </div>
-                  ))}
                 </div>
               </div>
             )}

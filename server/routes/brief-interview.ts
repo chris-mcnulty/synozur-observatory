@@ -21,7 +21,6 @@ import { getRequestContext } from "../context";
 import { guardFeature } from "./helpers";
 import { generateInterviewBriefs, generateInterviewSocialPosts } from "../services/brief-interview-service";
 import { formatPersonaContextForPrompt } from "../services/strategic-context";
-import { scanNewsForSubjects } from "../services/news-service";
 import { draftFromBrief } from "../services/copywriter-service";
 import { getPersonalVoiceProfile } from "../services/outbound-voice-service";
 import {
@@ -139,30 +138,6 @@ export function registerBriefInterviewRoutes(app: Express) {
     } catch (err: any) {
       console.error("[campaign-interview release-windows]", err);
       res.status(500).json({ error: err.message || "Failed to suggest windows" });
-    }
-  });
-
-  // Scan GNews for news hooks relevant to the supplied subjects (comma-sep or
-  // array). Used by the interview's "Scan for news hooks" button so the user
-  // can accept real headlines as news items instead of typing them manually.
-  app.get("/api/campaign-interview/news-scan", async (req, res) => {
-    try {
-      if (!(await guardFeature(req, res, "editorialCalendar"))) return;
-      const raw = req.query.subjects;
-      const subjects: string[] = Array.isArray(raw)
-        ? raw.map(String).flatMap((s) => s.split(",")).map((s) => s.trim()).filter(Boolean)
-        : typeof raw === "string"
-          ? raw.split(",").map((s) => s.trim()).filter(Boolean)
-          : [];
-      if (subjects.length === 0) {
-        return res.json({ results: [] });
-      }
-      const topic = str(req.query.topic) ?? undefined;
-      const results = await scanNewsForSubjects(subjects, 8, 60, topic);
-      res.json({ results });
-    } catch (err: any) {
-      console.error("[campaign-interview news-scan]", err);
-      res.status(500).json({ error: err.message || "Failed to scan news" });
     }
   });
 

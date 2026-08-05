@@ -3,98 +3,10 @@ import { createHash } from "crypto";
 import { storage } from "../storage";
 import { getRequestContext, ContextError } from "../context";
 import { toContextFilter, validateResourceContext, hasAdminAccess, hasContentAccess, logAiUsage, guardFeature, guardManualAction } from "./helpers";
-import { monitorCompetitorNews, monitorMultipleCompetitorsNews, type NewsMonitoringResult } from "../services/news-monitoring";
 import Anthropic from "@anthropic-ai/sdk";
 import type { Competitor } from "@shared/schema";
 
 export function registerAnalyticsDataRoutes(app: Express) {
-  // ==================== DATA SOURCES / NEWS ROUTES ====================
-
-  app.get("/api/data-sources/news", async (req, res) => {
-    try {
-      const ctx = await getRequestContext(req);
-      
-      const competitors = await storage.getCompetitorsByContext(toContextFilter(ctx));
-      
-      res.json({ 
-        results: [], 
-        competitorCount: competitors.length,
-        message: "Click 'Search for mentions' to scan for competitor news across the web. Results are fetched on-demand and are not stored."
-      });
-    } catch (error: any) {
-      if (error instanceof ContextError) {
-        return res.status(error.status).json({ error: error.message });
-      }
-      console.error("News fetch error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  app.post("/api/data-sources/news/refresh", async (req, res) => {
-    try {
-      const ctx = await getRequestContext(req);
-      
-      const tenant = await storage.getTenantByDomain(ctx.tenantDomain);
-      if (tenant?.plan === "free") {
-        return res.status(403).json({ error: "News monitoring is a premium feature. Please upgrade your plan." });
-      }
-      
-      const competitors = await storage.getCompetitorsByContext(toContextFilter(ctx));
-      
-      console.log(`[News] User ${req.session.userId} - ${competitors.length} competitors found`);
-      
-      const competitorData = competitors.map((c: Competitor) => ({
-        id: c.id,
-        name: c.name,
-        websiteUrl: c.url || undefined,
-      }));
-      
-      console.log(`[News] Searching news for: ${competitorData.map(c => c.name).join(', ')}`);
-      
-      const results = await monitorMultipleCompetitorsNews(competitorData);
-      
-      const totalMentions = results.reduce((sum, r) => sum + r.mentions.length, 0);
-      console.log(`[News] Completed - ${results.length} competitors scanned, ${totalMentions} total mentions found`);
-      
-      res.json({ results, fetchedAt: new Date().toISOString() });
-    } catch (error: any) {
-      if (error instanceof ContextError) {
-        return res.status(error.status).json({ error: error.message });
-      }
-      console.error("News refresh error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  app.get("/api/data-sources/news/:competitorId", async (req, res) => {
-    try {
-      const ctx = await getRequestContext(req);
-      
-      const competitor = await storage.getCompetitor(req.params.competitorId);
-      if (!competitor) {
-        return res.status(404).json({ error: "Competitor not found" });
-      }
-      
-      if (!validateResourceContext(competitor, ctx)) {
-        return res.status(403).json({ error: "Access denied" });
-      }
-      
-      const result = await monitorCompetitorNews(
-        competitor.id,
-        competitor.name,
-        competitor.url || undefined
-      );
-      
-      res.json(result);
-    } catch (error: any) {
-      if (error instanceof ContextError) {
-        return res.status(error.status).json({ error: error.message });
-      }
-      console.error("Competitor news fetch error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
   // ==================== ANALYTICS ROUTES ====================
 
   // Simple in-memory cache for IP to country lookups
