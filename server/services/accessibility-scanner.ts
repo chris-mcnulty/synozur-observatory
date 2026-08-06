@@ -467,6 +467,17 @@ export const axeCoreScanner: ScannerProvider = {
       25,
     );
 
+    // Time-budget guard — the job queue kills the job at 300s regardless.
+    // Reserve 60s for result saving; stop queuing new pages when the remaining
+    // budget is less than one full per-page allowance (50s) so we always return
+    // partial results rather than dying mid-scan with nothing.
+    const JOB_BUDGET_MS = 5 * 60 * 1000; // must match enqueueScan default
+    const BUDGET_RESERVE_MS = 60_000;     // reserved for evidence/findings save
+    const PER_PAGE_BUDGET_MS = 50_000;    // per-page timeout + axe runtime
+    const scanStartedAt = Date.now();
+    const budgetExhausted = () =>
+      Date.now() - scanStartedAt > JOB_BUDGET_MS - BUDGET_RESERVE_MS - PER_PAGE_BUDGET_MS;
+
     const startedAt = new Date();
     const axeSource = getAxeSource();
     const allFindings: (ScannerFinding & { _category: string })[] = [];
@@ -481,7 +492,12 @@ export const axeCoreScanner: ScannerProvider = {
     for (const pageUrl of pages) {
       if (request.signal?.aborted) break;
 
-      console.log(`[AccessibilityScanner] Scanning ${pageUrl}`);
+      if (budgetExhausted()) {
+        console.warn(`[AccessibilityScanner] Time budget exhausted — stopping after ${Object.keys(pageReports).length} page(s); ${pages.length - Object.keys(pageReports).length} page(s) skipped`);
+        break;
+      }
+
+      console.log(`[AccessibilityScanner] Scanning ${pageUrl} (elapsed ${Math.round((Date.now() - scanStartedAt) / 1000)}s)`);
 
       const scanResult = await runInPage(
         pageUrl,
@@ -497,7 +513,7 @@ export const axeCoreScanner: ScannerProvider = {
             });
           });
         },
-        { waitTime: 1500, timeout: 45000, ssrfProtect: true, waitUntil: "domcontentloaded", signal: request.signal },
+        { waitTime: 500, timeout: 40000, ssrfProtect: true, waitUntil: "domcontentloaded", signal: request.signal },
       );
 
       if (!scanResult) {
