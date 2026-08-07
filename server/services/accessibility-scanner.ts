@@ -587,16 +587,31 @@ export const axeCoreScanner: ScannerProvider = {
       console.log(`[AccessibilityScanner] ${pageUrl} — ${violations} violations, ${incomplete} needs-review`);
     }
 
+    // Pages actually scanned = those that made it into pageReports (budget may have cut the loop short)
+    const scannedPageUrls = Object.keys(pageReports);
+    const discoveredCount = pages.length;
+    const scannedCount = scannedPageUrls.length;
+    const partial = scannedCount < discoveredCount;
+
     const totalViolations = allFindings.filter((f) => f.ruleId !== "target-unreachable" && !f.ruleId.endsWith(":needs-review")).length;
-    console.log(`[AccessibilityScanner] ${pages.length} pages scanned — ${totalViolations} total violation instances (before cross-page dedup in scan runner)`);
+    console.log(
+      `[AccessibilityScanner] ${scannedCount}/${discoveredCount} pages scanned — ${totalViolations} total violation instances (before cross-page dedup in scan runner)` +
+        (partial ? ` [PARTIAL — ${discoveredCount - scannedCount} page(s) skipped due to time budget]` : ""),
+    );
 
     return {
       findings: allFindings,
       rawReport: {
         contentType: "application/json",
-        // Store the list of scanned pages alongside the per-page raw reports so
-        // the scan runner can reconstruct scannedPages for the scope-change guard.
-        body: JSON.stringify({ scannedPages: pages, pages: pageReports }, null, 2),
+        // scannedPages = URLs actually scanned (used by the scan runner's scope-change guard).
+        // discoveredPages = total pages discovered (may exceed scannedPages when budget ran out).
+        // partial = true when the time-budget guard stopped the scan early.
+        body: JSON.stringify({
+          scannedPages: scannedPageUrls,
+          discoveredPages: discoveredCount,
+          partial,
+          pages: pageReports,
+        }, null, 2),
       },
       tool: getAxeVersion(),
       startedAt,

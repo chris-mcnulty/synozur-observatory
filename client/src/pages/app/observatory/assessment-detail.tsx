@@ -74,6 +74,10 @@ interface ScanStatus {
   runningSec?: number;
   queuePosition?: number;
   errorMessage?: string;
+  /** True when the last accessibility scan stopped early due to the time budget. */
+  partial?: boolean;
+  scannedPages?: number;
+  discoveredPages?: number;
 }
 
 const SCANNABLE_TYPES = new Set(["accessibility", "penetration_test", "performance"]);
@@ -324,6 +328,25 @@ export default function ObservatoryAssessmentDetail() {
               <p className="text-sm font-medium text-destructive">Scan failed</p>
               <p className="text-xs text-muted-foreground mt-0.5">
                 {scanStatus.errorMessage ?? "The scan encountered an error. Please try again."}
+              </p>
+            </div>
+            {canWrite && (
+              <Button size="sm" variant="outline" onClick={() => triggerScan.mutate()} disabled={triggerScan.isPending}>
+                <ScanLine className="h-4 w-4 mr-1" /> Re-scan
+              </Button>
+            )}
+          </div>
+        )}
+
+        {/* Partial-scan notice — shown when an accessibility scan stopped early */}
+        {assessment.type === "accessibility" && scanStatus?.partial && !scanRunning && (
+          <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-3 flex items-center gap-3" data-testid="card-partial-scan-warning">
+            <AlertTriangle className="h-5 w-5 text-amber-500 flex-shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-amber-600 dark:text-amber-400">Partial scan — not all pages were covered</p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Scanned {scanStatus.scannedPages} of {scanStatus.discoveredPages} pages. The time budget was reached before all pages could be scanned.
+                Re-scan to try again, or switch to a Reserved VM deployment for longer scan windows.
               </p>
             </div>
             {canWrite && (

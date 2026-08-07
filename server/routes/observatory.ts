@@ -1401,7 +1401,42 @@ export function registerObservatoryRoutes(app: Express) {
       });
     }
 
-    res.json({ ...jobStatus, label: scanLabel, scannable: SCANNABLE_TYPES.has(assessment.type) });
+    // For completed accessibility scans, surface the partial-scan flag from the
+    // most recent scan_report evidence so the UI can warn users when the time
+    // budget stopped early and not all pages were covered.
+    let partialScanInfo: { partial: boolean; scannedPages: number; discoveredPages: number } | undefined;
+    if (assessment.type === "accessibility" && jobStatus.status === "not_found") {
+      try {
+        const [latestEvidence] = await db
+          .select({ body: obsEvidence.body })
+          .from(obsAssessmentEvidence)
+          .innerJoin(obsEvidence, eq(obsAssessmentEvidence.evidenceId, obsEvidence.id))
+          .where(
+            and(
+              eq(obsAssessmentEvidence.assessmentId, assessmentId),
+              eq(obsEvidence.evidenceType, "scan_report"),
+            ),
+          )
+          .orderBy(desc(obsEvidence.createdAt))
+          .limit(1);
+        if (latestEvidence?.body) {
+          const reportObj = JSON.parse(latestEvidence.body) as any;
+          const scannedPages = Array.isArray(reportObj?.scannedPages) ? reportObj.scannedPages.length : null;
+          const discoveredPages = typeof reportObj?.discoveredPages === "number" ? reportObj.discoveredPages : null;
+          if (scannedPages !== null && discoveredPages !== null) {
+            partialScanInfo = {
+              partial: scannedPages < discoveredPages,
+              scannedPages,
+              discoveredPages,
+            };
+          }
+        }
+      } catch {
+        // Non-critical: if we can't parse the evidence body, just omit partial info
+      }
+    }
+
+    res.json({ ...jobStatus, label: scanLabel, scannable: SCANNABLE_TYPES.has(assessment.type), ...partialScanInfo });
   });
 
   // ── Demo seed ─────────────────────────────────────────────────────────────
