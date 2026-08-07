@@ -10,7 +10,7 @@ const LAUNCH_ARGS = [
   "--disable-setuid-sandbox",
   "--disable-dev-shm-usage",
   "--disable-gpu",
-  "--single-process",
+  // --single-process removed: causes CDP protocol hangs in production
   "--no-zygote",
   "--disable-extensions",
   "--disable-background-networking",
@@ -33,7 +33,7 @@ async function createBrowser(): Promise<Browser> {
     headless: true,
     executablePath,
     args: LAUNCH_ARGS,
-    timeout: 30000,
+    timeout: 120000,
     protocolTimeout: 120000,
   });
 

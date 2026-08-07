@@ -46,4 +46,5 @@
 - [Drizzle correlated subquery counts](drizzle-correlated-subquery.md) — sql`` correlated count subqueries silently return 0; use leftJoin+groupBy instead and verify aggregates against direct SQL.
 - [Observatory workbenches](observatory-workbenches.md) — six modules on one table; pen-test findings wrap shared obs_findings; readiness weights/bands/blockers are a product contract; VPAT disclaimer mandatory.
 - [Observatory scan reconcile](observatory-scan-reconcile.md) — scans update/insert/auto-resolve by scanRuleId; never touch human statuses; skip auto-resolve on target-unreachable.
+- [Chromium --single-process CDP hangs](chromium-single-process-hang.md) — never use --single-process in puppeteer launches; it stalls launch/CDP in prod VM; crawler timeouts must stay ≤60s to fit the 300s scan budget.
 - [E2E API auth verification](e2e-api-auth-verification.md) — preview is login-gated; verify via temp bcrypt password on e2e-test user + curl session + X-Active-Tenant-Id header; dev AI provider 404s (env, not code).

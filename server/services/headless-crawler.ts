@@ -162,14 +162,23 @@ async function getBrowser(): Promise<Browser> {
   browserInstance = await puppeteer.launch({
     headless: true,
     executablePath,
-    protocolTimeout: 30000,
+    // Slow cold launches on Reserved VM deployments: puppeteer's 30s defaults
+    // killed launches with "Timed out waiting for the WS endpoint URL" and
+    // "Network.enable timed out". 60s is ~8x the observed cold-launch time and
+    // deliberately capped so a worst-case mid-scan relaunch still fits inside
+    // the accessibility scanner's 300s job budget (see its budget guard, which
+    // reserves 110s: a relaunch at the last allowed page is 60s launch + 40s
+    // page + save, staying under the queue deadline).
+    timeout: 60000,
+    protocolTimeout: 60000,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-accelerated-2d-canvas",
       "--disable-gpu",
-      "--single-process",
+      // NOTE: --single-process removed — it causes CDP protocol hangs
+      // (Network.enable timeouts) on Chromium 125 in production.
       "--no-zygote",
       "--window-size=1920,1080",
       "--disable-blink-features=AutomationControlled",

@@ -279,13 +279,15 @@ export async function measurePagePerformance(
   const browser: Browser = await puppeteer.launch({
     headless: true,
     executablePath,
+    timeout: 120000,
+    protocolTimeout: 120000,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-accelerated-2d-canvas",
       "--disable-gpu",
-      "--single-process",
+      // --single-process removed: causes CDP protocol hangs in production
       "--no-zygote",
       "--window-size=1920,1080",
       "--js-flags=--max-old-space-size=256",
