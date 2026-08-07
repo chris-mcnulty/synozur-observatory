@@ -1356,5 +1356,109 @@ describe("observatory routes", () => {
       expect(res.body.status).toBe("not_found");
       expect(dbQ).toHaveLength(0);
     });
+
+    // ── Partial-scan warning path ─────────────────────────────────────────────
+    //
+    // When an accessibility scan completes but stopped early (time budget
+    // exhausted), the scan runner stores a scan_report evidence row whose JSON
+    // body contains { scannedPages: string[], discoveredPages: number }.
+    // The scan-status endpoint reads that body and surfaces
+    //   { partial: true, scannedPages: N, discoveredPages: M }
+    // so the UI can render the amber partial-scan warning banner.
+    //
+    // DB call order for the partial-scan path (job not in memory, no DB failure):
+    //   1. SELECT type, status FROM obs_assessments WHERE id = :id AND tenant = :t
+    //   2. SELECT ... FROM scheduled_job_runs WHERE label = :label AND ...
+    //      ORDER BY started_at DESC LIMIT 1  → empty (no recent failure)
+    //   3. SELECT body FROM obs_assessment_evidence
+    //      INNER JOIN obs_evidence ON ...
+    //      WHERE assessment_id = :id AND evidence_type = 'scan_report'
+    //      ORDER BY created_at DESC LIMIT 1  → evidence row with JSON body
+
+    it("returns partial=true with page counts when the most recent scan_report evidence indicates a partial scan", async () => {
+      vi.mocked(getJobStatusByLabel).mockReturnValue({ status: "not_found" } as any);
+
+      // evidence body: scannedPages is an array (3 items) — discoveredPages is 8
+      const evidenceBody = JSON.stringify({
+        scannedPages: [
+          "https://portal.example.com/",
+          "https://portal.example.com/about",
+          "https://portal.example.com/contact",
+        ],
+        discoveredPages: 8,
+      });
+
+      pushDb({ type: "accessibility", status: "completed" }); // 1. assessment select
+      pushDb();                                                 // 2. scheduledJobRuns → [] (no failure)
+      pushDb({ body: evidenceBody });                           // 3. latest scan_report evidence
+
+      const res = await request(app).get("/api/observatory/assessments/asmnt-1/scan-status");
+
+      expect(res.status).toBe(200);
+      expect(res.body.partial).toBe(true);
+      expect(res.body.scannedPages).toBe(3);
+      expect(res.body.discoveredPages).toBe(8);
+      // scannable flag must also be present
+      expect(res.body.scannable).toBe(true);
+      // All three DB calls were consumed
+      expect(dbQ).toHaveLength(0);
+    });
+
+    it("returns partial=false when scannedPages equals discoveredPages (full scan completed)", async () => {
+      vi.mocked(getJobStatusByLabel).mockReturnValue({ status: "not_found" } as any);
+
+      const evidenceBody = JSON.stringify({
+        scannedPages: [
+          "https://portal.example.com/",
+          "https://portal.example.com/about",
+          "https://portal.example.com/faq",
+        ],
+        discoveredPages: 3,
+      });
+
+      pushDb({ type: "accessibility", status: "completed" }); // assessment select
+      pushDb();                                                 // scheduledJobRuns → []
+      pushDb({ body: evidenceBody });                           // scan_report evidence
+
+      const res = await request(app).get("/api/observatory/assessments/asmnt-1/scan-status");
+
+      expect(res.status).toBe(200);
+      expect(res.body.partial).toBe(false);
+      expect(res.body.scannedPages).toBe(3);
+      expect(res.body.discoveredPages).toBe(3);
+      expect(dbQ).toHaveLength(0);
+    });
+
+    it("omits partial fields when the scan_report evidence body is absent (no evidence yet)", async () => {
+      vi.mocked(getJobStatusByLabel).mockReturnValue({ status: "not_found" } as any);
+
+      pushDb({ type: "accessibility", status: "completed" }); // assessment select
+      pushDb();                                                 // scheduledJobRuns → []
+      pushDb();                                                 // scan_report evidence → [] (none)
+
+      const res = await request(app).get("/api/observatory/assessments/asmnt-1/scan-status");
+
+      expect(res.status).toBe(200);
+      expect(res.body.partial).toBeUndefined();
+      expect(res.body.scannedPages).toBeUndefined();
+      expect(res.body.discoveredPages).toBeUndefined();
+      expect(dbQ).toHaveLength(0);
+    });
+
+    it("does not query the scan_report evidence for non-accessibility assessment types", async () => {
+      vi.mocked(getJobStatusByLabel).mockReturnValue({ status: "not_found" } as any);
+
+      // Penetration test — the partial-scan evidence branch must be skipped
+      pushDb({ type: "penetration_test", status: "completed" }); // assessment select
+      pushDb();                                                     // scheduledJobRuns → []
+      // NO third dbQ push — the evidence query must NOT run for non-a11y types
+
+      const res = await request(app).get("/api/observatory/assessments/asmnt-1/scan-status");
+
+      expect(res.status).toBe(200);
+      expect(res.body.partial).toBeUndefined();
+      // dbQ still empty — evidence query was correctly skipped
+      expect(dbQ).toHaveLength(0);
+    });
   });
 });
