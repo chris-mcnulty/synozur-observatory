@@ -1423,11 +1423,13 @@ export function registerObservatoryRoutes(app: Express) {
           const reportObj = JSON.parse(latestEvidence.body) as any;
           const scannedPages = Array.isArray(reportObj?.scannedPages) ? reportObj.scannedPages.length : null;
           const discoveredPages = typeof reportObj?.discoveredPages === "number" ? reportObj.discoveredPages : null;
+          const pageLimit = typeof reportObj?.pageLimit === "number" ? reportObj.pageLimit : null;
           if (scannedPages !== null && discoveredPages !== null) {
             partialScanInfo = {
               partial: scannedPages < discoveredPages,
               scannedPages,
               discoveredPages,
+              ...(pageLimit !== null ? { pageLimit } : {}),
             };
           }
         }

@@ -78,6 +78,8 @@ interface ScanStatus {
   partial?: boolean;
   scannedPages?: number;
   discoveredPages?: number;
+  /** The effective pageLimit used in the last scan — persisted server-side in the scan report. */
+  pageLimit?: number;
 }
 
 const SCANNABLE_TYPES = new Set(["accessibility", "penetration_test", "performance"]);
@@ -128,6 +130,11 @@ export default function ObservatoryAssessmentDetail() {
     ? `/api/observatory/assessments/${id}/performance-scan`
     : `/api/observatory/assessments/${id}/scan`;
 
+  // Accessibility scan options dialog
+  const isAccessibilityType = !!assessment && assessment.type === "accessibility";
+  const [scanDialogOpen, setScanDialogOpen] = useState(false);
+  const [pageLimit, setPageLimit] = useState(10);
+
   // Track whether we were polling so we can detect scan completion/failure transitions
   const [scanPolling, setScanPolling] = useState(false);
   const { data: scanStatus } = useQuery<ScanStatus>({
@@ -164,7 +171,8 @@ export default function ObservatoryAssessmentDetail() {
   }, [scanStatus?.status]);
 
   const triggerScan = useMutation({
-    mutationFn: async () => (await apiRequest("POST", scanTriggerUrl, {})).json(),
+    mutationFn: async (opts?: { pageLimit?: number }) =>
+      (await apiRequest("POST", scanTriggerUrl, opts?.pageLimit != null ? { pageLimit: opts.pageLimit } : {})).json(),
     onSuccess: () => {
       setScanPolling(true);
       queryClient.invalidateQueries({ queryKey: [scanStatusUrl] });
@@ -172,6 +180,15 @@ export default function ObservatoryAssessmentDetail() {
     },
     onError: (err: Error) => toast({ title: "Scan failed to start", description: err.message, variant: "destructive" }),
   });
+
+  /** For accessibility assessments open the options dialog; for other types trigger directly. */
+  function handleRunScan() {
+    if (isAccessibilityType) {
+      setScanDialogOpen(true);
+    } else {
+      triggerScan.mutate({});
+    }
+  }
 
   const [findingDialogOpen, setFindingDialogOpen] = useState(false);
   const [findingForm, setFindingForm] = useState({
@@ -275,7 +292,7 @@ export default function ObservatoryAssessmentDetail() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => triggerScan.mutate()}
+                onClick={handleRunScan}
                 disabled={scanRunning || triggerScan.isPending}
                 data-testid="button-run-scan"
               >
@@ -331,7 +348,7 @@ export default function ObservatoryAssessmentDetail() {
               </p>
             </div>
             {canWrite && (
-              <Button size="sm" variant="outline" onClick={() => triggerScan.mutate()} disabled={triggerScan.isPending}>
+              <Button size="sm" variant="outline" onClick={handleRunScan} disabled={triggerScan.isPending}>
                 <ScanLine className="h-4 w-4 mr-1" /> Re-scan
               </Button>
             )}
@@ -345,12 +362,13 @@ export default function ObservatoryAssessmentDetail() {
             <div className="flex-1 min-w-0">
               <p className="text-sm font-medium text-amber-600 dark:text-amber-400">Partial scan — not all pages were covered</p>
               <p className="text-xs text-muted-foreground mt-0.5">
-                Scanned {scanStatus.scannedPages} of {scanStatus.discoveredPages} pages. The time budget was reached before all pages could be scanned.
-                Re-scan to try again, or switch to a Reserved VM deployment for longer scan windows.
+                Scanned {scanStatus.scannedPages} of {scanStatus.discoveredPages} discovered pages
+                {scanStatus.pageLimit != null ? ` (limit: ${scanStatus.pageLimit})` : ""}.
+                Increase the page limit and re-scan to cover more of the site.
               </p>
             </div>
             {canWrite && (
-              <Button size="sm" variant="outline" onClick={() => triggerScan.mutate()} disabled={triggerScan.isPending}>
+              <Button size="sm" variant="outline" onClick={handleRunScan} disabled={triggerScan.isPending}>
                 <ScanLine className="h-4 w-4 mr-1" /> Re-scan
               </Button>
             )}
@@ -368,7 +386,7 @@ export default function ObservatoryAssessmentDetail() {
               </p>
             </div>
             {canWrite && (
-              <Button size="sm" onClick={() => triggerScan.mutate()} disabled={triggerScan.isPending}>
+              <Button size="sm" onClick={handleRunScan} disabled={triggerScan.isPending}>
                 <ScanLine className="h-4 w-4 mr-1" /> Run scan
               </Button>
             )}
@@ -489,6 +507,53 @@ export default function ObservatoryAssessmentDetail() {
           </Card>
         )}
       </div>
+
+      {/* Accessibility scan options dialog */}
+      <Dialog open={scanDialogOpen && isAccessibilityType} onOpenChange={setScanDialogOpen}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Run Accessibility Scan</DialogTitle>
+            <DialogDescription>
+              Choose how many pages to crawl. Higher limits improve coverage but take longer.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-1">
+            <div className="space-y-2">
+              <Label htmlFor="page-limit-select">Page limit</Label>
+              <Select value={String(pageLimit)} onValueChange={(v) => setPageLimit(Number(v))}>
+                <SelectTrigger id="page-limit-select" data-testid="select-page-limit">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {[1, 2, 3, 5, 10, 15, 20, 25].map((n) => (
+                    <SelectItem key={n} value={String(n)}>
+                      {n} {n === 1 ? "page" : "pages"}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Default: 10 pages. Maximum: 25 pages per scan.
+              </p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setScanDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                setScanDialogOpen(false);
+                triggerScan.mutate({ pageLimit });
+              }}
+              disabled={triggerScan.isPending}
+              data-testid="button-confirm-run-scan"
+            >
+              <ScanLine className="h-4 w-4 mr-1" /> Start scan
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={findingDialogOpen} onOpenChange={setFindingDialogOpen}>
         <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">

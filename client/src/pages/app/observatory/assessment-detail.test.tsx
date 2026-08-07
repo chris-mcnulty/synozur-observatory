@@ -134,8 +134,25 @@ describe("ObservatoryAssessmentDetail — partial-scan warning banner", () => {
 
     // Banner must be present
     expect(screen.getByTestId("card-partial-scan-warning")).toBeTruthy();
-    // Must show page counts
-    expect(screen.getByText(/3 of 8 pages/i)).toBeTruthy();
+    // Must show page counts in the new "Scanned X of Y discovered pages" wording
+    expect(screen.getByText(/scanned 3 of 8 discovered pages/i)).toBeTruthy();
+  });
+
+  it("shows the server-provided page limit in the banner when pageLimit is returned by scan-status", () => {
+    setupMocks({
+      status: "not_found",
+      scannable: true,
+      partial: true,
+      scannedPages: 3,
+      discoveredPages: 8,
+      pageLimit: 20,
+    });
+
+    render(<ObservatoryAssessmentDetail />);
+
+    expect(screen.getByTestId("card-partial-scan-warning")).toBeTruthy();
+    // The "(limit: N)" segment must appear alongside the page counts
+    expect(screen.getByText(/scanned 3 of 8 discovered pages \(limit: 20\)/i)).toBeTruthy();
   });
 
   it("does NOT render the banner when scan-status has partial=false", () => {

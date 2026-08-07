@@ -610,6 +610,10 @@ export const axeCoreScanner: ScannerProvider = {
           scannedPages: scannedPageUrls,
           discoveredPages: discoveredCount,
           partial,
+          // Persist the effective page limit so the scan-status endpoint can
+          // surface it in the UI after a page reload (avoids relying on
+          // client-only state for the partial-scan coverage notice).
+          pageLimit,
           pages: pageReports,
         }, null, 2),
       },
