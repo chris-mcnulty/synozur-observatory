@@ -18,3 +18,5 @@ Both scan paths (general `observatory-scan-runner.ts` and pen-test route) reconc
 Headless-Chromium scan jobs get CPU-throttled on Autoscale outside request handling and time out; heavy background scanning needs a Reserved VM. `scheduled_job_runs` is the ground truth for job outcomes — in-memory scan-status polling lies after instance recycles. Scan failure paths must restore the assessment's prior status or it sticks at "in_progress".
 ## Reconcile scoping lesson
 Auto-resolve must be scoped to exactly what the current scan measured — both the rule-ID namespace the scan path owns AND the URL/target it just scanned. Anything broader falsely remediates findings from other scan paths or other pages. Assert namespace disjointness and cross-URL isolation in tests.
+
+**Scan history:** every scan run also writes an obs_scan_history snapshot (new/fixed/unchanged counters + open counts by severity, partial/page metadata) after reconcile — powers the scan-over-scan comparison card and the prioritized fix-list CSV/PDF export (open+in_progress, Critical→Informational). CSV export must keep formula-injection neutralization (leading = + - @ prefixed with ').

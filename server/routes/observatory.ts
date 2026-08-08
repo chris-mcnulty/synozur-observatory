@@ -31,6 +31,7 @@ import {
   obsReviewItemEvidence,
   obsFindingControls,
   obsAuditLogs,
+  obsScanHistory,
   scheduledJobRuns,
   insertObsApplicationSchema,
   insertObsVersionSchema,
@@ -50,6 +51,7 @@ import { seedStandardsCatalog } from "../services/observatory-standards";
 import { seedObservatoryDemo } from "../services/observatory-demo-seed";
 import { enqueueScan, getJobStatusByLabel } from "../services/job-queue";
 import { runObservatoryScan } from "../services/observatory-scan-runner";
+import { renderReportPdf } from "../services/observatory-report-service";
 // Ensure the axe-core scanner is registered in the global registry at startup
 import "../services/accessibility-scanner";
 const objectStorageService = new ObjectStorageService();
@@ -538,6 +540,152 @@ export function registerObservatoryRoutes(app: Express) {
       res.json({ ...row, application, version, findings, evidence: evidence.map((e) => e.evidence) });
     } catch (err) {
       handleError(res, err, "assessment");
+    }
+  });
+
+  // ── Scan history — one row per completed automated scan run ───────────────
+  app.get("/api/observatory/assessments/:id/scan-history", async (req, res) => {
+    const ctx = await ctxOr401(req, res);
+    if (!ctx) return;
+    try {
+      const [row] = await db
+        .select({ id: obsAssessments.id })
+        .from(obsAssessments)
+        .where(and(eq(obsAssessments.id, req.params.id), eq(obsAssessments.tenantDomain, ctx.tenantDomain)));
+      if (!row) return res.status(404).json({ message: "Assessment not found" });
+      const history = await db
+        .select()
+        .from(obsScanHistory)
+        .where(and(eq(obsScanHistory.assessmentId, row.id), eq(obsScanHistory.tenantDomain, ctx.tenantDomain)))
+        .orderBy(desc(obsScanHistory.createdAt))
+        .limit(50);
+      res.json(history);
+    } catch (err) {
+      handleError(res, err, "scan history");
+    }
+  });
+
+  // ── Prioritized fix-list export (CSV / PDF) ────────────────────────────────
+  // Actionable findings (open + in_progress) sorted Critical → Informational.
+  const SEVERITY_ORDER: Record<string, number> = { Critical: 0, High: 1, Medium: 2, Low: 3, Informational: 4 };
+  const ACTIONABLE_STATUSES = ["open", "in_progress"];
+
+  async function loadFixList(ctx: RequestContext, assessmentId: string) {
+    const [assessment] = await db
+      .select({ assessment: obsAssessments, applicationName: obsApplications.name })
+      .from(obsAssessments)
+      .innerJoin(obsApplications, eq(obsAssessments.applicationId, obsApplications.id))
+      .where(and(eq(obsAssessments.id, assessmentId), eq(obsAssessments.tenantDomain, ctx.tenantDomain)));
+    if (!assessment) return null;
+    const findings = await db
+      .select()
+      .from(obsFindings)
+      .where(and(
+        eq(obsFindings.assessmentId, assessmentId),
+        eq(obsFindings.tenantDomain, ctx.tenantDomain),
+        inArray(obsFindings.status, ACTIONABLE_STATUSES),
+      ));
+    findings.sort((a, b) =>
+      (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9) ||
+      a.title.localeCompare(b.title));
+    return { assessment: assessment.assessment, applicationName: assessment.applicationName, findings };
+  }
+
+  function parseSourcePages(raw: string | null): string {
+    if (!raw) return "";
+    try {
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr.join(" ") : "";
+    } catch { return ""; }
+  }
+
+  app.get("/api/observatory/assessments/:id/findings/export.csv", async (req, res) => {
+    const ctx = await ctxOr401(req, res);
+    if (!ctx) return;
+    try {
+      const data = await loadFixList(ctx, req.params.id);
+      if (!data) return res.status(404).json({ message: "Assessment not found" });
+      const csvEsc = (v: unknown) => {
+        let s = v == null ? "" : String(v);
+        // Neutralize spreadsheet formula injection: values starting with
+        // = + - @ (or tab/CR variants) execute as formulas in Excel/Sheets.
+        if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+        return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      };
+      const header = ["Priority", "Severity", "Title", "WCAG Criterion", "Affected Component", "Pages", "Recommendation", "Status", "First Seen"];
+      const lines = [header.join(",")];
+      data.findings.forEach((f, i) => {
+        lines.push([
+          i + 1,
+          f.severity,
+          f.title,
+          f.wcagCriterion ?? "",
+          f.affectedComponent ?? "",
+          parseSourcePages(f.sourcePages),
+          f.recommendation ?? "",
+          f.status,
+          f.createdAt?.toISOString().slice(0, 10) ?? "",
+        ].map(csvEsc).join(","));
+      });
+      const filename = `fix-list_${data.applicationName}_${new Date().toISOString().slice(0, 10)}`
+        .replace(/[^a-zA-Z0-9 _.-]/g, "").replace(/\s+/g, "_");
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}.csv"`);
+      res.send("\uFEFF" + lines.join("\r\n"));
+    } catch (err) {
+      handleError(res, err, "fix-list CSV export");
+    }
+  });
+
+  app.get("/api/observatory/assessments/:id/findings/export.pdf", async (req, res) => {
+    const ctx = await ctxOr401(req, res);
+    if (!ctx) return;
+    try {
+      const data = await loadFixList(ctx, req.params.id);
+      if (!data) return res.status(404).json({ message: "Assessment not found" });
+      const esc = (s: unknown) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const sevColor: Record<string, string> = { Critical: "#b91c1c", High: "#dc2626", Medium: "#d97706", Low: "#2563eb", Informational: "#6b7280" };
+      const rows = data.findings.map((f, i) => `
+        <tr>
+          <td class="num">${i + 1}</td>
+          <td><span class="sev" style="background:${sevColor[f.severity] ?? "#6b7280"}">${esc(f.severity)}</span></td>
+          <td>
+            <div class="title">${esc(f.title)}</div>
+            ${f.wcagCriterion ? `<div class="meta">WCAG ${esc(f.wcagCriterion)}</div>` : ""}
+            ${f.affectedComponent ? `<div class="meta mono">${esc(f.affectedComponent)}</div>` : ""}
+            ${parseSourcePages(f.sourcePages) ? `<div class="meta">${esc(parseSourcePages(f.sourcePages))}</div>` : ""}
+            ${f.recommendation ? `<div class="rec">${esc(f.recommendation)}</div>` : ""}
+          </td>
+          <td class="meta">${esc(f.status.replace(/_/g, " "))}</td>
+        </tr>`).join("");
+      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+        body { font-family: Helvetica, Arial, sans-serif; font-size: 11px; color: #111; margin: 24px; }
+        h1 { font-size: 18px; margin: 0 0 2px; } .sub { color: #555; margin-bottom: 16px; }
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; font-size: 10px; text-transform: uppercase; color: #555; border-bottom: 2px solid #ddd; padding: 6px 8px; }
+        td { border-bottom: 1px solid #eee; padding: 8px; vertical-align: top; }
+        .num { color: #888; width: 24px; }
+        .sev { color: #fff; border-radius: 3px; padding: 2px 6px; font-size: 10px; white-space: nowrap; }
+        .title { font-weight: bold; margin-bottom: 2px; }
+        .meta { color: #666; font-size: 10px; margin-top: 2px; word-break: break-all; }
+        .mono { font-family: monospace; }
+        .rec { margin-top: 4px; color: #333; }
+      </style></head><body>
+        <h1>Prioritized Fix List — ${esc(data.applicationName)}</h1>
+        <div class="sub">${esc(data.assessment.title)} · ${data.findings.length} item(s) to fix · Generated ${new Date().toISOString().slice(0, 10)} · Sorted by severity</div>
+        <table>
+          <thead><tr><th>#</th><th>Severity</th><th>Finding</th><th>Status</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </body></html>`;
+      const pdf = await renderReportPdf(html, `Fix list ${data.applicationName}`);
+      const filename = `fix-list_${data.applicationName}_${new Date().toISOString().slice(0, 10)}`
+        .replace(/[^a-zA-Z0-9 _.-]/g, "").replace(/\s+/g, "_");
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}.pdf"`);
+      res.send(pdf);
+    } catch (err) {
+      handleError(res, err, "fix-list PDF export");
     }
   });
 

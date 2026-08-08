@@ -5168,6 +5168,34 @@ export const obsFindings = pgTable("obs_findings", {
   statusIdx: index("obs_findings_status_idx").on(t.tenantDomain, t.status),
 }));
 
+// ── Scan history ────────────────────────────────────────────────────────────
+// One row per completed automated scan run — a snapshot of reconcile counters
+// and post-scan open-finding counts, powering scan-over-scan comparisons.
+export const obsScanHistory = pgTable("obs_scan_history", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  tenantDomain: text("tenant_domain").notNull(),
+  assessmentId: varchar("assessment_id").notNull().references(() => obsAssessments.id, { onDelete: "cascade" }),
+  applicationId: varchar("application_id").notNull().references(() => obsApplications.id, { onDelete: "cascade" }),
+  tool: text("tool").notNull(),
+  findingsNew: integer("findings_new").notNull().default(0),
+  findingsResolved: integer("findings_resolved").notNull().default(0),
+  findingsUnchanged: integer("findings_unchanged").notNull().default(0),
+  // Open finding counts (status = open) immediately after this scan's reconcile.
+  openCritical: integer("open_critical").notNull().default(0),
+  openHigh: integer("open_high").notNull().default(0),
+  openMedium: integer("open_medium").notNull().default(0),
+  openLow: integer("open_low").notNull().default(0),
+  openInfo: integer("open_info").notNull().default(0),
+  scannedPages: integer("scanned_pages"),
+  discoveredPages: integer("discovered_pages"),
+  partial: boolean("partial").notNull().default(false),
+  durationMs: integer("duration_ms"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (t) => ({
+  tenantIdx: index("obs_scan_history_tenant_idx").on(t.tenantDomain),
+  assessmentIdx: index("obs_scan_history_assessment_idx").on(t.assessmentId),
+}));
+
 // ── Evidence ────────────────────────────────────────────────────────────────
 export const obsEvidence = pgTable("obs_evidence", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
@@ -5295,6 +5323,10 @@ export type InsertObsControl = z.infer<typeof insertObsControlSchema>;
 export const insertObsFindingSchema = createInsertSchema(obsFindings).omit({ id: true, createdAt: true, updatedAt: true });
 export type ObsFinding = typeof obsFindings.$inferSelect;
 export type InsertObsFinding = z.infer<typeof insertObsFindingSchema>;
+
+export const insertObsScanHistorySchema = createInsertSchema(obsScanHistory).omit({ id: true, createdAt: true });
+export type ObsScanHistory = typeof obsScanHistory.$inferSelect;
+export type InsertObsScanHistory = z.infer<typeof insertObsScanHistorySchema>;
 
 export const insertObsEvidenceSchema = createInsertSchema(obsEvidence).omit({ id: true, createdAt: true, updatedAt: true });
 export type ObsEvidence = typeof obsEvidence.$inferSelect;

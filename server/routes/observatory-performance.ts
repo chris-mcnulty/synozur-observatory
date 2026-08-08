@@ -22,7 +22,7 @@
  */
 import type { Express, Request, Response } from "express";
 import { db } from "../db";
-import { and, desc, eq, gte, inArray } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { getRequestContext, ContextError, type RequestContext } from "../context";
 import { hasContentAccess } from "./helpers";
 import {
@@ -34,6 +34,7 @@ import {
   obsPerformanceScans,
   obsPerformanceScanPages,
   obsAuditLogs,
+  obsScanHistory,
   scheduledJobRuns,
 } from "@shared/schema";
 import { z } from "zod";
@@ -132,6 +133,12 @@ export async function executePerfScan(opts: ExecuteScanOptions): Promise<void> {
 
   let totalFindingCount = 0;
   let allFailed = true;
+  const perfStarted = Date.now();
+  // Aggregated reconcile counters across all pages, for the scan-history snapshot.
+  let historyNew = 0;
+  let historyResolved = 0;
+  let historyUnchanged = 0;
+  let pagesSucceeded = 0;
 
   for (const pageUrl of allUrls) {
     // Create a page row for this URL immediately (status=running).
@@ -236,6 +243,11 @@ export async function executePerfScan(opts: ExecuteScanOptions): Promise<void> {
         })
         .where(eq(obsPerformanceScanPages.id, pageRow.id));
 
+      historyNew += plan.toInsert.length;
+      historyResolved += plan.toResolveIds.length;
+      historyUnchanged += plan.toUpdate.length;
+      pagesSucceeded++;
+
       totalFindingCount += pageFindingCount;
       allFailed = false;
       console.log(`[perf-scan] ${pageUrl} — ${pageFindingCount} finding(s) [${scanSource}]`);
@@ -266,6 +278,45 @@ export async function executePerfScan(opts: ExecuteScanOptions): Promise<void> {
     await db.insert(obsAssessmentEvidence).values({ assessmentId: assessment.id, evidenceId: ev.id }).onConflictDoNothing();
   } catch (evErr) {
     console.error("[perf-scan] Failed to persist evidence:", evErr);
+  }
+
+  // ── Scan-history snapshot ──────────────────────────────────────────────────
+  // Same contract as observatory-scan-runner: one row per completed scan run
+  // with reconcile counters + open counts by severity. Never fails the scan.
+  if (!allFailed) {
+    try {
+      const openRows = await db
+        .select({ severity: obsFindings.severity, n: sql<number>`count(*)::int` })
+        .from(obsFindings)
+        .where(and(
+          eq(obsFindings.assessmentId, assessment.id),
+          eq(obsFindings.tenantDomain, tenantDomain),
+          eq(obsFindings.status, "open"),
+        ))
+        .groupBy(obsFindings.severity);
+      const open: Record<string, number> = {};
+      for (const r of openRows) open[r.severity] = r.n;
+      await db.insert(obsScanHistory).values({
+        tenantDomain,
+        assessmentId: assessment.id,
+        applicationId: assessment.applicationId,
+        tool: "performance-scanner",
+        findingsNew: historyNew,
+        findingsResolved: historyResolved,
+        findingsUnchanged: historyUnchanged,
+        openCritical: open["Critical"] ?? 0,
+        openHigh: open["High"] ?? 0,
+        openMedium: open["Medium"] ?? 0,
+        openLow: open["Low"] ?? 0,
+        openInfo: open["Informational"] ?? 0,
+        scannedPages: pagesSucceeded,
+        discoveredPages: allUrls.length,
+        partial: pagesSucceeded < allUrls.length,
+        durationMs: Date.now() - perfStarted,
+      });
+    } catch (histErr) {
+      console.error("[perf-scan] Failed to record scan history (non-fatal):", histErr);
+    }
   }
 
   const batchStatus = allFailed ? "failed" : "completed";

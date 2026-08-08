@@ -14,7 +14,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useUser } from "@/lib/userContext";
-import { ArrowLeft, Plus, Loader2, Trash2, AlertTriangle, Archive, ScanLine, CheckCircle2, Clock, Gauge } from "lucide-react";
+import { ArrowLeft, Plus, Loader2, Trash2, AlertTriangle, Archive, ScanLine, CheckCircle2, Clock, Gauge, Download, History } from "lucide-react";
 import {
   AssessmentStatusBadge,
   SeverityBadge,
@@ -84,6 +84,23 @@ interface ScanStatus {
 
 const SCANNABLE_TYPES = new Set(["accessibility", "penetration_test", "performance"]);
 
+interface ScanHistoryRow {
+  id: string;
+  tool: string;
+  findingsNew: number;
+  findingsResolved: number;
+  findingsUnchanged: number;
+  openCritical: number;
+  openHigh: number;
+  openMedium: number;
+  openLow: number;
+  openInfo: number;
+  scannedPages: number | null;
+  discoveredPages: number | null;
+  partial: boolean;
+  createdAt: string;
+}
+
 function ScanStatusBadge({ scanStatus }: { scanStatus: ScanStatus | undefined }) {
   if (!scanStatus || scanStatus.status === "not_found") return null;
   if (scanStatus.status === "failed") {
@@ -118,6 +135,33 @@ export default function ObservatoryAssessmentDetail() {
   const canWrite = ["Analyst", "Domain Admin", "Global Admin"].includes(user?.role ?? "");
 
   const { data: assessment, isLoading } = useQuery<Detail>({ queryKey: [`/api/observatory/assessments/${id}`] });
+  const { data: scanHistory } = useQuery<ScanHistoryRow[]>({ queryKey: [`/api/observatory/assessments/${id}/scan-history`] });
+  const [exporting, setExporting] = useState<"csv" | "pdf" | null>(null);
+
+  const exportFixList = async (format: "csv" | "pdf") => {
+    setExporting(format);
+    try {
+      const res = await fetch(`/api/observatory/assessments/${id}/findings/export.${format}`, { credentials: "include" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ message: "Export failed" }));
+        toast({ title: "Export failed", description: err.message ?? "Could not generate the export.", variant: "destructive" });
+        return;
+      }
+      const blob = await res.blob();
+      const disposition = res.headers.get("Content-Disposition") ?? "";
+      const match = disposition.match(/filename="([^"]+)"/);
+      const a = document.createElement("a");
+      const url = URL.createObjectURL(blob);
+      a.href = url;
+      a.download = match ? match[1] : `fix-list.${format}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      toast({ title: "Export failed", description: err instanceof Error ? err.message : String(err), variant: "destructive" });
+    } finally {
+      setExporting(null);
+    }
+  };
 
   // ── Scan status polling ──────────────────────────────────────────────────
   // Performance assessments use a dedicated scan endpoint with its own status
@@ -434,6 +478,16 @@ export default function ObservatoryAssessmentDetail() {
                   <Loader2 className="h-3 w-3 animate-spin" /> Scan in progress…
                 </span>
               )}
+              {assessment.findings.length > 0 && (
+                <>
+                  <Button size="sm" variant="outline" onClick={() => exportFixList("csv")} disabled={exporting !== null} data-testid="button-export-fixlist-csv">
+                    {exporting === "csv" ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Download className="h-4 w-4 mr-1" />} CSV
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => exportFixList("pdf")} disabled={exporting !== null} data-testid="button-export-fixlist-pdf">
+                    {exporting === "pdf" ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Download className="h-4 w-4 mr-1" />} PDF
+                  </Button>
+                </>
+              )}
               {canWrite && (
                 <Button size="sm" onClick={() => setFindingDialogOpen(true)} data-testid="button-new-finding">
                   <Plus className="h-4 w-4 mr-1" /> New Finding
@@ -486,6 +540,62 @@ export default function ObservatoryAssessmentDetail() {
             )}
           </CardContent>
         </Card>
+
+        {scanHistory && scanHistory.length > 0 && (
+          <Card data-testid="card-scan-history">
+            <CardHeader>
+              <CardTitle className="text-base flex items-center gap-2">
+                <History className="h-4 w-4" /> Scan History ({scanHistory.length})
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-xs text-muted-foreground mb-3">
+                Each scan is compared to the previous one: findings no longer detected are marked fixed automatically, new issues are added, and everything else stays open.
+              </p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-xs text-muted-foreground border-b border-border">
+                      <th className="text-left py-2 pr-3 font-medium">Date</th>
+                      <th className="text-right py-2 px-2 font-medium">Pages</th>
+                      <th className="text-right py-2 px-2 font-medium">New</th>
+                      <th className="text-right py-2 px-2 font-medium">Fixed</th>
+                      <th className="text-right py-2 px-2 font-medium">Unchanged</th>
+                      <th className="text-right py-2 pl-2 font-medium">Open (C / H / M / L)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {scanHistory.map((h) => {
+                      const totalOpen = h.openCritical + h.openHigh + h.openMedium + h.openLow + h.openInfo;
+                      return (
+                        <tr key={h.id} className="border-b border-border/50" data-testid={`row-scan-history-${h.id}`}>
+                          <td className="py-2 pr-3 whitespace-nowrap">
+                            {formatDate(h.createdAt)}
+                            {h.partial && <Badge variant="outline" className="ml-2 text-[10px] border-amber-500/50 text-amber-600 dark:text-amber-400">partial</Badge>}
+                          </td>
+                          <td className="py-2 px-2 text-right text-muted-foreground">
+                            {h.scannedPages != null ? `${h.scannedPages}${h.discoveredPages != null && h.discoveredPages !== h.scannedPages ? `/${h.discoveredPages}` : ""}` : "—"}
+                          </td>
+                          <td className={`py-2 px-2 text-right ${h.findingsNew > 0 ? "text-destructive font-medium" : "text-muted-foreground"}`}>
+                            {h.findingsNew > 0 ? `+${h.findingsNew}` : "0"}
+                          </td>
+                          <td className={`py-2 px-2 text-right ${h.findingsResolved > 0 ? "text-green-600 dark:text-green-400 font-medium" : "text-muted-foreground"}`}>
+                            {h.findingsResolved > 0 ? `−${h.findingsResolved}` : "0"}
+                          </td>
+                          <td className="py-2 px-2 text-right text-muted-foreground">{h.findingsUnchanged}</td>
+                          <td className="py-2 pl-2 text-right whitespace-nowrap">
+                            <span className="font-medium">{totalOpen}</span>
+                            <span className="text-xs text-muted-foreground ml-1">({h.openCritical} / {h.openHigh} / {h.openMedium} / {h.openLow})</span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {assessment.type === "performance" && assessment.application && (
           <Card data-testid="card-performance-scan">

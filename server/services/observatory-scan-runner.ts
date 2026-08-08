@@ -19,8 +19,9 @@
  */
 
 import { db } from "../db";
-import { eq, and, inArray } from "drizzle-orm";
+import { eq, and, inArray, sql } from "drizzle-orm";
 import {
+  obsScanHistory,
   obsAssessments,
   obsApplications,
   obsFindings,
@@ -184,12 +185,18 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
   // Recover the set of pages actually scanned this run from the raw report.
   // Used by the scope-change guard when deciding which findings to auto-resolve.
   const scannedPages = new Set<string>();
+  // Report-level metadata used for the scan-history snapshot (accessibility scans).
+  let reportPartial = false;
+  let reportDiscoveredPages: number | null = null;
   try {
     if (result.rawReport?.body) {
       const reportObj = JSON.parse(result.rawReport.body) as any;
       if (Array.isArray(reportObj?.scannedPages)) {
         for (const url of reportObj.scannedPages as string[]) scannedPages.add(url);
       }
+      if (typeof reportObj?.partial === "boolean") reportPartial = reportObj.partial;
+      if (typeof reportObj?.discoveredPages === "number") reportDiscoveredPages = reportObj.discoveredPages;
+      else if (Array.isArray(reportObj?.discoveredPages)) reportDiscoveredPages = reportObj.discoveredPages.length;
     }
   } catch {
     // non-JSON raw report (e.g. security scanner) — scannedPages stays empty;
@@ -422,6 +429,43 @@ export async function runObservatoryScan(opts: ScanRunOptions): Promise<ScanRunR
       })
       .where(inArray(obsFindings.id, staleOpenIds));
     findingsResolved = staleOpenIds.length;
+  }
+
+  // ── 6c. Record scan-history snapshot ───────────────────────────────────────
+  // One row per scan run: reconcile counters + open counts by severity after
+  // reconcile. Powers the scan-over-scan comparison UI. Never fails the scan.
+  try {
+    const openRows = await db
+      .select({ severity: obsFindings.severity, n: sql<number>`count(*)::int` })
+      .from(obsFindings)
+      .where(and(
+        eq(obsFindings.assessmentId, assessmentId),
+        eq(obsFindings.tenantDomain, tenantDomain),
+        eq(obsFindings.status, "open"),
+      ))
+      .groupBy(obsFindings.severity);
+    const open: Record<string, number> = {};
+    for (const r of openRows) open[r.severity] = r.n;
+    await db.insert(obsScanHistory).values({
+      tenantDomain,
+      assessmentId,
+      applicationId: assessment.applicationId,
+      tool: result.tool,
+      findingsNew: findingsCreated,
+      findingsResolved,
+      findingsUnchanged: findingsSkipped,
+      openCritical: open["Critical"] ?? 0,
+      openHigh: open["High"] ?? 0,
+      openMedium: open["Medium"] ?? 0,
+      openLow: open["Low"] ?? 0,
+      openInfo: open["Informational"] ?? 0,
+      scannedPages: scannedPages.size > 0 ? scannedPages.size : null,
+      discoveredPages: reportDiscoveredPages,
+      partial: reportPartial,
+      durationMs: Date.now() - started,
+    });
+  } catch (err) {
+    console.error("[ScanRunner] Failed to record scan history (non-fatal):", err);
   }
 
   // ── 7. Mark assessment completed ─────────────────────────────────────────
