@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -77,6 +78,18 @@ export default function ObservatoryFindingDetail() {
 
   const invalidate = () =>
     queryClient.invalidateQueries({ predicate: (q) => String(q.queryKey[0]).startsWith("/api/observatory") });
+
+  const [notesDraft, setNotesDraft] = useState<string | null>(null);
+  const notesMutation = useMutation({
+    mutationFn: async (remediationNotes: string) =>
+      (await apiRequest("PATCH", `/api/observatory/findings/${id}`, { remediationNotes })).json(),
+    onSuccess: () => {
+      invalidate();
+      setNotesDraft(null);
+      toast({ title: "Notes saved" });
+    },
+    onError: (err: Error) => toast({ title: "Save failed", description: err.message, variant: "destructive" }),
+  });
 
   const statusMutation = useMutation({
     mutationFn: async (status: string) => (await apiRequest("PATCH", `/api/observatory/findings/${id}`, { status })).json(),
@@ -212,12 +225,27 @@ export default function ObservatoryFindingDetail() {
                   <p data-testid="text-finding-recommendation">{finding.recommendation}</p>
                 </div>
               )}
-              {finding.remediationNotes && (
-                <div>
-                  <p className="text-xs text-muted-foreground mb-1">Remediation notes</p>
-                  <p>{finding.remediationNotes}</p>
-                </div>
-              )}
+              <div>
+                <p className="text-xs text-muted-foreground mb-1">Remediation / analysis notes</p>
+                <Textarea
+                  value={notesDraft ?? finding.remediationNotes ?? ""}
+                  onChange={(e) => setNotesDraft(e.target.value)}
+                  placeholder="Record your analysis here — e.g. why this is accepted risk, retest results, or how it was fixed."
+                  rows={4}
+                  data-testid="input-remediation-notes"
+                />
+                {notesDraft !== null && notesDraft !== (finding.remediationNotes ?? "") && (
+                  <Button
+                    size="sm"
+                    className="mt-2"
+                    onClick={() => notesMutation.mutate(notesDraft)}
+                    disabled={notesMutation.isPending}
+                    data-testid="button-save-notes"
+                  >
+                    {notesMutation.isPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />} Save notes
+                  </Button>
+                )}
+              </div>
             </CardContent>
           </Card>
           <Card>
