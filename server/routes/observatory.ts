@@ -51,7 +51,7 @@ import { seedStandardsCatalog } from "../services/observatory-standards";
 import { seedObservatoryDemo } from "../services/observatory-demo-seed";
 import { enqueueScan, getJobStatusByLabel } from "../services/job-queue";
 import { runObservatoryScan } from "../services/observatory-scan-runner";
-import { renderReportPdf } from "../services/observatory-report-service";
+import { renderReportPdf, reportShell } from "../services/observatory-report-service";
 // Ensure the axe-core scanner is registered in the global registry at startup
 import "../services/accessibility-scanner";
 const objectStorageService = new ObjectStorageService();
@@ -644,40 +644,34 @@ export function registerObservatoryRoutes(app: Express) {
       const data = await loadFixList(ctx, req.params.id);
       if (!data) return res.status(404).json({ message: "Assessment not found" });
       const esc = (s: unknown) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      const sevColor: Record<string, string> = { Critical: "#b91c1c", High: "#dc2626", Medium: "#d97706", Low: "#2563eb", Informational: "#6b7280" };
-      const rows = data.findings.map((f, i) => `
+      // Chip colors follow the report engine's severity palette (border/text on light bg).
+      const sevChip: Record<string, string> = { Critical: "#b91c1c", High: "#dc2626", Medium: "#d97706", Low: "#2563eb", Informational: "#6b7280" };
+      const rows = data.findings.map((f, i) => {
+        const c = sevChip[f.severity] ?? "#6b7280";
+        return `
         <tr>
-          <td class="num">${i + 1}</td>
-          <td><span class="sev" style="background:${sevColor[f.severity] ?? "#6b7280"}">${esc(f.severity)}</span></td>
+          <td style="color:#888;width:24px;">${i + 1}</td>
+          <td><span class="chip" style="border-color:${c};color:${c};">${esc(f.severity)}</span></td>
           <td>
-            <div class="title">${esc(f.title)}</div>
+            <strong>${esc(f.title)}</strong>
             ${f.wcagCriterion ? `<div class="meta">WCAG ${esc(f.wcagCriterion)}</div>` : ""}
-            ${f.affectedComponent ? `<div class="meta mono">${esc(f.affectedComponent)}</div>` : ""}
-            ${parseSourcePages(f.sourcePages) ? `<div class="meta">${esc(parseSourcePages(f.sourcePages))}</div>` : ""}
-            ${f.recommendation ? `<div class="rec">${esc(f.recommendation)}</div>` : ""}
+            ${f.affectedComponent ? `<div class="meta" style="font-family:monospace;word-break:break-all;">${esc(f.affectedComponent)}</div>` : ""}
+            ${parseSourcePages(f.sourcePages) ? `<div class="meta" style="word-break:break-all;">${esc(parseSourcePages(f.sourcePages))}</div>` : ""}
+            ${f.recommendation ? `<p style="margin:4px 0 0;color:#333;">${esc(f.recommendation)}</p>` : ""}
           </td>
           <td class="meta">${esc(f.status.replace(/_/g, " "))}</td>
-        </tr>`).join("");
-      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-        body { font-family: Helvetica, Arial, sans-serif; font-size: 11px; color: #111; margin: 24px; }
-        h1 { font-size: 18px; margin: 0 0 2px; } .sub { color: #555; margin-bottom: 16px; }
-        table { width: 100%; border-collapse: collapse; }
-        th { text-align: left; font-size: 10px; text-transform: uppercase; color: #555; border-bottom: 2px solid #ddd; padding: 6px 8px; }
-        td { border-bottom: 1px solid #eee; padding: 8px; vertical-align: top; }
-        .num { color: #888; width: 24px; }
-        .sev { color: #fff; border-radius: 3px; padding: 2px 6px; font-size: 10px; white-space: nowrap; }
-        .title { font-weight: bold; margin-bottom: 2px; }
-        .meta { color: #666; font-size: 10px; margin-top: 2px; word-break: break-all; }
-        .mono { font-family: monospace; }
-        .rec { margin-top: 4px; color: #333; }
-      </style></head><body>
-        <h1>Prioritized Fix List — ${esc(data.applicationName)}</h1>
-        <div class="sub">${esc(data.assessment.title)} · ${data.findings.length} item(s) to fix · Generated ${new Date().toISOString().slice(0, 10)} · Sorted by severity</div>
+        </tr>`;
+      }).join("");
+      const body = `
         <table>
           <thead><tr><th>#</th><th>Severity</th><th>Finding</th><th>Status</th></tr></thead>
           <tbody>${rows}</tbody>
-        </table>
-      </body></html>`;
+        </table>`;
+      const html = reportShell(
+        `Prioritized Fix List — ${data.applicationName}`,
+        `${data.assessment.title} · ${data.findings.length} item(s) to fix · Sorted by severity`,
+        body,
+      );
       const pdf = await renderReportPdf(html, `Fix list ${data.applicationName}`);
       const filename = `fix-list_${data.applicationName}_${new Date().toISOString().slice(0, 10)}`
         .replace(/[^a-zA-Z0-9 _.-]/g, "").replace(/\s+/g, "_");

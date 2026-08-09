@@ -121,7 +121,7 @@ function baseCss(): string {
   `;
 }
 
-function reportShell(title: string, subtitle: string, body: string): string {
+export function reportShell(title: string, subtitle: string, body: string): string {
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>${esc(title)}</title><style>${baseCss()}</style></head>
 <body>
