@@ -32,7 +32,7 @@ interface Detail {
   domain: string;
   status: string;
   recommendation: string | null;
-  remediationNotes: string | null;
+  remediationPlan: string | null;
   affectedComponent: string | null;
   wcagCriterion: string | null;
   cweId: string | null;
@@ -81,8 +81,8 @@ export default function ObservatoryFindingDetail() {
 
   const [notesDraft, setNotesDraft] = useState<string | null>(null);
   const notesMutation = useMutation({
-    mutationFn: async (remediationNotes: string) =>
-      (await apiRequest("PATCH", `/api/observatory/findings/${id}`, { remediationNotes })).json(),
+    mutationFn: async (remediationPlan: string) =>
+      (await apiRequest("PATCH", `/api/observatory/findings/${id}`, { remediationPlan })).json(),
     onSuccess: () => {
       invalidate();
       setNotesDraft(null);
@@ -228,13 +228,13 @@ export default function ObservatoryFindingDetail() {
               <div>
                 <p className="text-xs text-muted-foreground mb-1">Remediation / analysis notes</p>
                 <Textarea
-                  value={notesDraft ?? finding.remediationNotes ?? ""}
+                  value={notesDraft ?? finding.remediationPlan ?? ""}
                   onChange={(e) => setNotesDraft(e.target.value)}
                   placeholder="Record your analysis here — e.g. why this is accepted risk, retest results, or how it was fixed."
                   rows={4}
                   data-testid="input-remediation-notes"
                 />
-                {notesDraft !== null && notesDraft !== (finding.remediationNotes ?? "") && (
+                {notesDraft !== null && notesDraft !== (finding.remediationPlan ?? "") && (
                   <Button
                     size="sm"
                     className="mt-2"
