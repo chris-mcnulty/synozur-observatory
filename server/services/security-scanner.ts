@@ -296,11 +296,15 @@ function makeRequest(
               const isExpired = validTo ? now > validTo : false;
 
               tlsCert = {
-                valid: !isExpired && !isNotYetValid && !socket.isSessionReused?.(),
+                valid: !isExpired && !isNotYetValid,
                 daysUntilExpiry,
                 subject: cert.subject?.CN,
                 issuer: cert.issuer?.O,
               };
+            } else if (socket.isSessionReused?.()) {
+              // Resumed TLS sessions legitimately return an empty peer cert —
+              // the cert was already validated on the original handshake.
+              // Leave tlsCert undefined so no finding is raised.
             } else {
               tlsCert = { valid: false, daysUntilExpiry: null, error: "No certificate" };
             }
@@ -681,9 +685,22 @@ export const securityScanner: ScannerProvider = {
 
     const finishedAt = new Date();
 
+    // Every URL this run actually checked: the main page plus every sensitive
+    // path probed. The reconcile scope-change guard only auto-resolves findings
+    // whose source pages are all in this set — without the probe URLs here,
+    // fixed sensitive-path findings (e.g. /.env) could never auto-resolve.
+    const scannedPages = Array.from(new Set([
+      targetUrl,
+      fetchResult.finalUrl,
+      ...SENSITIVE_PATHS.map((sp) => {
+        try { return new URL(sp.path, targetUrl).href; } catch { return null; }
+      }).filter((u): u is string => u !== null),
+    ]));
+
     const rawReport = {
       scannedUrl: targetUrl,
       finalUrl: fetchResult.finalUrl,
+      scannedPages,
       statusCode: fetchResult.statusCode,
       redirectChain: fetchResult.redirectChain,
       responseHeaders: fetchResult.headers,
