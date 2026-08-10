@@ -36,10 +36,11 @@ const CATEGORY_LABELS: Record<string, string> = {
 function FrameworkCard({ framework }: { framework: Framework }) {
   const [expanded, setExpanded] = useState(false);
   const [search, setSearch] = useState("");
-  const { data: controls, isLoading } = useQuery<Control[]>({
+  const { data, isLoading } = useQuery<{ controls: Control[] }>({
     queryKey: [`/api/observatory/frameworks/${framework.id}/controls`],
     enabled: expanded,
   });
+  const controls = Array.isArray(data?.controls) ? data.controls : [];
 
   const filtered = (controls ?? []).filter(
     (c) =>
