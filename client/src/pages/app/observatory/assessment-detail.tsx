@@ -473,6 +473,15 @@ export default function ObservatoryAssessmentDetail() {
           <CardHeader className="flex flex-row items-center justify-between space-y-0">
             <CardTitle className="text-base flex items-center gap-2"><AlertTriangle className="h-4 w-4" /> Findings ({assessment.findings.length})</CardTitle>
             <div className="flex items-center gap-2">
+              {assessment.findings.length > 0 && (
+                <Link
+                  href={`/app/observatory/findings?assessmentId=${assessment.id}`}
+                  className="text-xs text-primary hover:underline mr-1"
+                  data-testid="link-findings-filtered"
+                >
+                  Open in Findings
+                </Link>
+              )}
               {scanRunning && (
                 <span className="text-xs text-muted-foreground flex items-center gap-1">
                   <Loader2 className="h-3 w-3 animate-spin" /> Scan in progress…

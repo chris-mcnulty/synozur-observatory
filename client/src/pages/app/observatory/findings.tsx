@@ -24,6 +24,7 @@ export default function ObservatoryFindings() {
   const search = useSearch();
   const params = new URLSearchParams(search);
   const applicationIdFilter = params.get("applicationId") ?? "";
+  const assessmentIdFilter = params.get("assessmentId") ?? "";
 
   const [severity, setSeverity] = useState("all");
   const [domain, setDomain] = useState("all");
@@ -32,6 +33,7 @@ export default function ObservatoryFindings() {
 
   const qp = new URLSearchParams();
   if (applicationIdFilter) qp.set("applicationId", applicationIdFilter);
+  if (assessmentIdFilter) qp.set("assessmentId", assessmentIdFilter);
   if (severity !== "all") qp.set("severity", severity);
   if (domain !== "all") qp.set("domain", domain);
   if (status !== "all") qp.set("status", status);
@@ -48,9 +50,33 @@ export default function ObservatoryFindings() {
         <div>
           <h1 className="text-2xl font-semibold" data-testid="text-findings-title">Findings</h1>
           <p className="text-muted-foreground text-sm mt-1">
-            Every finding across assessments. Findings are recorded from an assessment's detail page.
+            {assessmentIdFilter || applicationIdFilter
+              ? "Filtered view — showing findings for one item only."
+              : "Every finding across assessments. Findings are recorded from an assessment's detail page."}
           </p>
         </div>
+
+        {(assessmentIdFilter || applicationIdFilter) && (
+          <div className="flex items-center gap-3 rounded-md border bg-muted/40 px-4 py-2 text-sm" data-testid="banner-findings-filter">
+            <span className="text-muted-foreground">
+              Showing findings for{" "}
+              <span className="font-medium text-foreground">
+                {(findings?.[0] &&
+                  (assessmentIdFilter
+                    ? `${findings[0].applicationName} · ${findings[0].assessmentTitle}`
+                    : findings[0].applicationName)) ||
+                  (assessmentIdFilter ? "this assessment" : "this application")}
+              </span>
+            </span>
+            <Link
+              href="/app/observatory/findings"
+              className="text-primary hover:underline shrink-0"
+              data-testid="link-clear-findings-filter"
+            >
+              Show all findings
+            </Link>
+          </div>
+        )}
 
         <div className="flex gap-3 flex-wrap items-center">
           <div className="relative">

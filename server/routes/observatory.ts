@@ -572,11 +572,18 @@ export function registerObservatoryRoutes(app: Express) {
 
   async function loadFixList(ctx: RequestContext, assessmentId: string) {
     const [assessment] = await db
-      .select({ assessment: obsAssessments, applicationName: obsApplications.name })
+      .select({ assessment: obsAssessments, application: obsApplications })
       .from(obsAssessments)
       .innerJoin(obsApplications, eq(obsAssessments.applicationId, obsApplications.id))
       .where(and(eq(obsAssessments.id, assessmentId), eq(obsAssessments.tenantDomain, ctx.tenantDomain)));
     if (!assessment) return null;
+    // Version linked to the assessment (if any) for header details.
+    const version = assessment.assessment.versionId
+      ? (await db
+          .select()
+          .from(obsVersions)
+          .where(and(eq(obsVersions.id, assessment.assessment.versionId), eq(obsVersions.tenantDomain, ctx.tenantDomain))))[0] ?? null
+      : null;
     const findings = await db
       .select()
       .from(obsFindings)
@@ -588,7 +595,7 @@ export function registerObservatoryRoutes(app: Express) {
     findings.sort((a, b) =>
       (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9) ||
       a.title.localeCompare(b.title));
-    return { assessment: assessment.assessment, applicationName: assessment.applicationName, findings };
+    return { assessment: assessment.assessment, application: assessment.application, applicationName: assessment.application.name, version, findings };
   }
 
   function parseSourcePages(raw: string | null): string {
@@ -613,7 +620,17 @@ export function registerObservatoryRoutes(app: Express) {
         return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
       };
       const header = ["Priority", "Severity", "Title", "WCAG Criterion", "Affected Component", "Pages", "Recommendation", "Status", "First Seen"];
-      const lines = [header.join(",")];
+      const preamble: string[][] = [
+        ["Prioritized Fix List", "Synozur — www.synozur.com"],
+        ["Application", data.application.name],
+        ...(data.version ? [["Version", data.version.versionNumber]] : []),
+        ...(data.application.appUrl ? [["App URL", data.application.appUrl]] : []),
+        ...(data.application.hostingPlatform ? [["Hosting", data.application.hostingPlatform]] : []),
+        ["Assessment", data.assessment.title],
+        ["Generated", new Date().toISOString().slice(0, 10)],
+        [],
+      ];
+      const lines = [...preamble.map((r) => r.map(csvEsc).join(",")), header.join(",")];
       data.findings.forEach((f, i) => {
         lines.push([
           i + 1,
@@ -662,7 +679,25 @@ export function registerObservatoryRoutes(app: Express) {
           <td class="meta">${esc(f.status.replace(/_/g, " "))}</td>
         </tr>`;
       }).join("");
+      const app = data.application;
+      const appDetails: [string, string | null][] = [
+        ["Application", app.name],
+        ["Version", data.version?.versionNumber ?? null],
+        ["Environment", data.version?.environment ?? null],
+        ["App URL", app.appUrl],
+        ["Hosting", app.hostingPlatform],
+        ["Product family", app.productFamily],
+        ["Business owner", app.businessOwner],
+        ["Technical owner", app.technicalOwner],
+      ];
+      const detailRows = appDetails
+        .filter(([, v]) => v)
+        .map(([k, v]) => `<tr><td style="color:#888;white-space:nowrap;padding-right:12px;">${esc(k)}</td><td>${esc(v)}</td></tr>`)
+        .join("");
       const body = `
+        <div class="callout" style="margin-top:0;">
+          <table style="border:none;">${detailRows}</table>
+        </div>
         <table>
           <thead><tr><th>#</th><th>Severity</th><th>Finding</th><th>Status</th></tr></thead>
           <tbody>${rows}</tbody>
@@ -671,6 +706,7 @@ export function registerObservatoryRoutes(app: Express) {
         `Prioritized Fix List — ${data.applicationName}`,
         `${data.assessment.title} · ${data.findings.length} item(s) to fix · Sorted by severity`,
         body,
+        { brand: "Synozur", brandUrl: "www.synozur.com" },
       );
       const pdf = await renderReportPdf(html, `Fix list ${data.applicationName}`);
       const filename = `fix-list_${data.applicationName}_${new Date().toISOString().slice(0, 10)}`
