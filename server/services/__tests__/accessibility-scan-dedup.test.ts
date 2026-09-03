@@ -278,6 +278,38 @@ describe("accessibility scan deduplication and auto-resolve", () => {
     expect(result.findingsSkipped).toBe(0);
   });
 
+  it("auto-resolves an exposed-env-file finding when its source URL appears in scannedPages and no finding remains", async () => {
+    const envUrl = "https://host/.env";
+    const staleEnvFinding = {
+      id: "find-env",
+      title: "Environment Configuration File Accessible",
+      affectedComponent: null,
+      status: "open",
+      scanRuleId: "exposed-env-file",
+      sourcePages: JSON.stringify([envUrl]),
+    };
+
+    mockRunScan.mockResolvedValue({
+      ...makeScanResult([]),
+      rawReport: {
+        contentType: "application/json",
+        body: JSON.stringify({ scannedPages: ["https://host/", envUrl] }),
+      },
+    });
+
+    pushPreamble([staleEnvFinding]);
+    push([]); // auto-resolve stale exposed-env-file finding
+    pushAssessmentComplete();
+
+    const result = await runObservatoryScan({
+      assessmentId: ASSESSMENT_ID,
+      tenantDomain: TENANT,
+    });
+
+    expect(result.findingsResolved).toBe(1);
+    expect(result.findingsCreated).toBe(0);
+  });
+
   // 4. Human-set status is never overwritten ────────────────────────────────────
 
   it("does not auto-resolve a finding with a human-set status even when its rule is absent from the new scan", async () => {

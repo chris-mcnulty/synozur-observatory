@@ -233,6 +233,45 @@ interface FetchResult {
   };
 }
 
+type TlsCertificate = FetchResult["tlsCert"];
+
+/**
+ * Read certificate metadata from a TLS socket. Session-resumed sockets may
+ * legitimately return an empty peer certificate, so that case is represented
+ * as undefined rather than as an invalid certificate.
+ */
+export function inspectTlsSocket(
+  socket: {
+    getPeerCertificate?: () => any;
+    isSessionReused?: () => boolean;
+  },
+  now = Date.now(),
+): TlsCertificate {
+  try {
+    const cert = socket.getPeerCertificate?.();
+    if (cert && cert.subject) {
+      const validTo = cert.valid_to ? new Date(cert.valid_to).getTime() : null;
+      const validFrom = cert.valid_from ? new Date(cert.valid_from).getTime() : null;
+      const daysUntilExpiry = validTo
+        ? Math.floor((validTo - now) / 86400000)
+        : null;
+      const isNotYetValid = validFrom ? now < validFrom : false;
+      const isExpired = validTo ? now > validTo : false;
+
+      return {
+        valid: !isExpired && !isNotYetValid,
+        daysUntilExpiry,
+        subject: cert.subject?.CN,
+        issuer: cert.issuer?.O,
+      };
+    }
+    if (socket.isSessionReused?.()) return undefined;
+    return { valid: false, daysUntilExpiry: null, error: "No certificate" };
+  } catch {
+    return { valid: false, daysUntilExpiry: null, error: "Certificate inspection failed" };
+  }
+}
+
 function makeRequest(
   url: string,
   options: { followRedirects?: boolean; timeout?: number; method?: string } = {},
@@ -283,34 +322,7 @@ function makeRequest(
         // Capture TLS info on HTTPS connections
         if (isHttps) {
           const socket = res.socket as any;
-          try {
-            const cert = socket.getPeerCertificate?.();
-            if (cert && cert.subject) {
-              const now = Date.now();
-              const validTo = cert.valid_to ? new Date(cert.valid_to).getTime() : null;
-              const validFrom = cert.valid_from ? new Date(cert.valid_from).getTime() : null;
-              const daysUntilExpiry = validTo
-                ? Math.floor((validTo - now) / 86400000)
-                : null;
-              const isNotYetValid = validFrom ? now < validFrom : false;
-              const isExpired = validTo ? now > validTo : false;
-
-              tlsCert = {
-                valid: !isExpired && !isNotYetValid,
-                daysUntilExpiry,
-                subject: cert.subject?.CN,
-                issuer: cert.issuer?.O,
-              };
-            } else if (socket.isSessionReused?.()) {
-              // Resumed TLS sessions legitimately return an empty peer cert —
-              // the cert was already validated on the original handshake.
-              // Leave tlsCert undefined so no finding is raised.
-            } else {
-              tlsCert = { valid: false, daysUntilExpiry: null, error: "No certificate" };
-            }
-          } catch {
-            tlsCert = { valid: false, daysUntilExpiry: null, error: "Certificate inspection failed" };
-          }
+          tlsCert = inspectTlsSocket(socket);
         }
 
         const location = res.headers["location"] as string | undefined;
@@ -397,7 +409,7 @@ async function checkHttpToHttpsRedirect(
   return null;
 }
 
-async function checkTlsCertificate(
+export async function checkTlsCertificate(
   appUrl: string,
   fetchResult: FetchResult,
 ): Promise<ScannerFinding[]> {
